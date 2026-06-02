@@ -43,7 +43,6 @@ extern int changemode(int, int, char *);
 #define HEX_REG_OFFSET 0
 #define HEX_REG_HEX    1
 #define HEX_REG_GAP    2
-#define HEX_REG_ASCII  3
 
 static int hexmode_toggle(int, int);
 static int hex_self_insert(int, int);
@@ -73,10 +72,12 @@ static int  hex_parse_byte(struct line *, int, unsigned char *);
 static int  hex_collect_bytes(struct buffer *, unsigned char **, size_t *);
 static int  hex_format_layout(const unsigned char *, size_t, char **, size_t *);
 static int  hex_install_layout(struct buffer *, const unsigned char *, size_t, int);
-static int  hex_byte_under_cursor(uint64_t *, int *);
-static void hex_goto_byte(uint64_t, int);
-static int  hex_delete_one(uint64_t, int);
+static int  hex_byte_under_cursor(uint64_t *);
+static void hex_goto_byte(uint64_t);
+static int  hex_delete_one(uint64_t);
 static int  hex_region_active(uint64_t *, uint64_t *);
+static int  hex_forw_line(int, int);
+static int  hex_back_line(int, int);
 
 /* Range 0x01..0x19 inclusive: control-key bindings. */
 static PF hex_ctl_pf[] = {
@@ -93,9 +94,9 @@ static PF hex_ctl_pf[] = {
 	rescan,				/* 0x0b  C-k */
 	rescan,				/* 0x0c  C-l */
 	rescan,				/* 0x0d  C-m / RET */
-	rescan,				/* 0x0e  C-n */
+	hex_forw_line,			/* 0x0e  C-n */
 	rescan,				/* 0x0f  C-o */
-	rescan,				/* 0x10  C-p */
+	hex_back_line,			/* 0x10  C-p */
 	rescan,				/* 0x11  C-q */
 	rescan,				/* 0x12  C-r */
 	rescan,				/* 0x13  C-s */
@@ -169,6 +170,8 @@ hexmode_init(void)
 	funmap_add(hex_delete_byte_forward, "hex-delete-byte-forward", 0);
 	funmap_add(hex_forw_byte, "hex-forw-byte", 0);
 	funmap_add(hex_back_byte, "hex-back-byte", 0);
+	funmap_add(hex_forw_line, "hex-forw-line", 0);
+	funmap_add(hex_back_line, "hex-back-line", 0);
 	funmap_add(hex_bol, "hex-beginning-of-line", 0);
 	funmap_add(hex_eol, "hex-end-of-line", 0);
 	funmap_add(hex_kill_region, "hex-kill-region", 0);
@@ -237,12 +240,7 @@ hex_locate(int col, int *byte_in_row, int *nibble, int *region)
 		*region = HEX_REG_OFFSET;
 		return;
 	}
-	if (col >= HEX_ASCII_FIRST_COL && col <= HEX_ASCII_LAST_COL) {
-		*region = HEX_REG_ASCII;
-		*byte_in_row = col - HEX_ASCII_FIRST_COL;
-		return;
-	}
-	if (col == HEX_GUTTER_OPEN_COL || col == HEX_GUTTER_CLOSE_COL) {
+	if (col >= HEX_GUTTER_OPEN_COL) {
 		*region = HEX_REG_GAP;
 		return;
 	}
@@ -702,24 +700,23 @@ hexmode_toggle(int f, int n)
 /* ---------- cursor helpers ---------- */
 
 static int
-hex_byte_under_cursor(uint64_t *out_byte, int *out_in_ascii)
+hex_byte_under_cursor(uint64_t *out_byte)
 {
 	int byte_in_row, nibble, region;
 	uint64_t row_off;
 
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	if (region != HEX_REG_HEX && region != HEX_REG_ASCII)
+	if (region != HEX_REG_HEX)
 		return FALSE;
 	if (byte_in_row < 0)
 		return FALSE;
 	row_off = hex_offset_of_line(curwp->w_dotp);
 	*out_byte = row_off + (uint64_t)byte_in_row;
-	*out_in_ascii = (region == HEX_REG_ASCII);
 	return TRUE;
 }
 
 static void
-hex_goto_byte(uint64_t byte_idx, int in_ascii)
+hex_goto_byte(uint64_t byte_idx)
 {
 	struct line *lp;
 	uint64_t target_row_off;
@@ -729,10 +726,7 @@ hex_goto_byte(uint64_t byte_idx, int in_ascii)
 
 	target_row_off = byte_idx & ~(uint64_t)(HEX_BYTES_PER_ROW - 1);
 	byte_in_row = (int)(byte_idx - target_row_off);
-	if (in_ascii)
-		col = hex_ascii_col_for_byte(byte_in_row);
-	else
-		col = hex_col_for_byte(byte_in_row, 0);
+	col = hex_col_for_byte(byte_in_row, 0);
 
 	for (lp = bfirstlp(curbp); lp != curbp->b_headp; lp = lforw(lp)) {
 		if (hex_offset_of_line(lp) == target_row_off) {
@@ -749,10 +743,7 @@ hex_goto_byte(uint64_t byte_idx, int in_ascii)
 	if (lp != curbp->b_headp) {
 		int row_bytes = hex_row_byte_count(lp);
 		int idx = (row_bytes > 0) ? row_bytes - 1 : 0;
-		if (in_ascii)
-			curwp->w_doto = hex_ascii_col_for_byte(idx);
-		else
-			curwp->w_doto = hex_col_for_byte(idx, 0);
+		curwp->w_doto = hex_col_for_byte(idx, 0);
 		curwp->w_dotp = lp;
 		curwp->w_dotline = lineno - 1;
 		curwp->w_rflag |= WFMOVE;
@@ -766,7 +757,6 @@ hex_self_insert(int f, int n)
 {
 	int c = key.k_chars[key.k_count - 1];
 	int byte_in_row, nibble, region;
-	uint64_t row_off;
 	unsigned char old_byte = 0;
 	int hi_col, lo_col, a_col;
 	int v;
@@ -775,93 +765,59 @@ hex_self_insert(int f, int n)
 		return (dobeep_msg("Buffer is read only"));
 
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	row_off = hex_offset_of_line(curwp->w_dotp);
 
-	if (region == HEX_REG_HEX) {
-		if (!hex_is_hex_digit(c))
-			return (dobeep_msg("Not a hex digit"));
-		if (hex_parse_byte(curwp->w_dotp, byte_in_row, &old_byte)
-		    != TRUE)
-			return (dobeep_msg("Cursor not on a byte"));
+	if (region != HEX_REG_HEX)
+		return (dobeep_msg("Cursor not on an editable position"));
 
-		v = hex_val(c);
-		if (nibble == 0)
-			old_byte = (unsigned char)((v << 4) | (old_byte & 0xf));
-		else
-			old_byte = (unsigned char)((old_byte & 0xf0) | v);
+	if (!hex_is_hex_digit(c))
+		return (dobeep_msg("Not a hex digit"));
+	if (hex_parse_byte(curwp->w_dotp, byte_in_row, &old_byte) != TRUE)
+		return (dobeep_msg("Cursor not on a byte"));
 
-		undo_boundary_enable(FFRAND, 0);
+	v = hex_val(c);
+	if (nibble == 0)
+		old_byte = (unsigned char)((v << 4) | (old_byte & 0xf));
+	else
+		old_byte = (unsigned char)((old_byte & 0xf0) | v);
 
-		hi_col = hex_col_for_byte(byte_in_row, 0);
-		lo_col = hex_col_for_byte(byte_in_row, 1);
-		a_col  = hex_ascii_col_for_byte(byte_in_row);
+	undo_boundary_enable(FFRAND, 0);
 
-		if (nibble == 0) {
-			undo_add_change(curwp->w_dotp, hi_col, 1);
-			lputc(curwp->w_dotp, hi_col,
-			    hex_digit((old_byte >> 4) & 0xf));
-		} else {
-			undo_add_change(curwp->w_dotp, lo_col, 1);
-			lputc(curwp->w_dotp, lo_col,
-			    hex_digit(old_byte & 0xf));
-		}
-		if (a_col < llength(curwp->w_dotp)) {
-			char a_char = (old_byte >= 0x20 && old_byte < 0x7f) ?
-			    (char)old_byte : '.';
-			undo_add_change(curwp->w_dotp, a_col, 1);
-			lputc(curwp->w_dotp, a_col, a_char);
-		}
+	hi_col = hex_col_for_byte(byte_in_row, 0);
+	lo_col = hex_col_for_byte(byte_in_row, 1);
+	a_col  = hex_ascii_col_for_byte(byte_in_row);
 
-		curbp->b_flag |= BFCHG;
-		lchange(WFEDIT);
-
-		if (nibble == 0)
-			curwp->w_doto = lo_col;
-		else
-			(void)hex_forw_byte(FFRAND, 1);
-
-		undo_boundary_enable(FFRAND, 1);
-		return (TRUE);
-	} else if (region == HEX_REG_ASCII) {
-		uint64_t next;
-
-		if (c < 0x20 || c > 0x7e)
-			return (dobeep_msg("Non-printable in ASCII column"));
-		if (byte_in_row >= hex_row_byte_count(curwp->w_dotp))
-			return (dobeep_msg("Past end of buffer"));
-
-		old_byte = (unsigned char)c;
-		hi_col = hex_col_for_byte(byte_in_row, 0);
-		lo_col = hex_col_for_byte(byte_in_row, 1);
-		a_col  = hex_ascii_col_for_byte(byte_in_row);
-
-		undo_boundary_enable(FFRAND, 0);
-
+	if (nibble == 0) {
 		undo_add_change(curwp->w_dotp, hi_col, 1);
 		lputc(curwp->w_dotp, hi_col,
 		    hex_digit((old_byte >> 4) & 0xf));
+	} else {
 		undo_add_change(curwp->w_dotp, lo_col, 1);
-		lputc(curwp->w_dotp, lo_col, hex_digit(old_byte & 0xf));
+		lputc(curwp->w_dotp, lo_col,
+		    hex_digit(old_byte & 0xf));
+	}
+	if (a_col < llength(curwp->w_dotp)) {
+		char a_char = (old_byte >= 0x20 && old_byte < 0x7f) ?
+		    (char)old_byte : '.';
 		undo_add_change(curwp->w_dotp, a_col, 1);
-		lputc(curwp->w_dotp, a_col, (char)c);
-
-		curbp->b_flag |= BFCHG;
-		lchange(WFEDIT);
-
-		next = row_off + (uint64_t)byte_in_row + 1;
-		hex_goto_byte(next, TRUE);
-
-		undo_boundary_enable(FFRAND, 1);
-		return (TRUE);
+		lputc(curwp->w_dotp, a_col, a_char);
 	}
 
-	return (dobeep_msg("Cursor not on an editable position"));
+	curbp->b_flag |= BFCHG;
+	lchange(WFEDIT);
+
+	if (nibble == 0)
+		curwp->w_doto = lo_col;
+	else
+		(void)hex_forw_byte(FFRAND, 1);
+
+	undo_boundary_enable(FFRAND, 1);
+	return (TRUE);
 }
 
 /* ---------- delete ---------- */
 
 static int
-hex_delete_one(uint64_t byte_idx, int in_ascii)
+hex_delete_one(uint64_t byte_idx)
 {
 	unsigned char *data;
 	size_t data_len;
@@ -893,9 +849,9 @@ hex_delete_one(uint64_t byte_idx, int in_ascii)
 		curwp->w_doto = HEX_FIRST_HEX_COL;
 		curwp->w_dotline = 1;
 	} else if (byte_idx < data_len) {
-		hex_goto_byte(byte_idx, in_ascii);
+		hex_goto_byte(byte_idx);
 	} else {
-		hex_goto_byte(data_len - 1, in_ascii);
+		hex_goto_byte(data_len - 1);
 	}
 	curwp->w_rflag |= WFFULL | WFMOVE;
 	free(data);
@@ -906,7 +862,6 @@ static int
 hex_delete_byte(int f, int n)
 {
 	uint64_t byte_idx;
-	int in_ascii;
 	int byte_in_row, nibble, region;
 	uint64_t row_off;
 	uint64_t rs, re;
@@ -914,21 +869,21 @@ hex_delete_byte(int f, int n)
 	if (hex_region_active(&rs, &re))
 		return (hex_kill_region(f, n));
 
-	if (hex_byte_under_cursor(&byte_idx, &in_ascii) == TRUE) {
+	if (hex_byte_under_cursor(&byte_idx) == TRUE) {
 		if (byte_idx == 0)
 			return (dobeep_msg("Beginning of buffer"));
 		byte_idx--;
-		return (hex_delete_one(byte_idx, in_ascii));
+		return (hex_delete_one(byte_idx));
 	}
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
 	row_off = hex_offset_of_line(curwp->w_dotp);
 	if (byte_in_row > 0) {
 		byte_idx = row_off + (uint64_t)(byte_in_row - 1);
-		return (hex_delete_one(byte_idx, region == HEX_REG_ASCII));
+		return (hex_delete_one(byte_idx));
 	}
 	if (row_off > 0) {
 		byte_idx = row_off - 1;
-		return (hex_delete_one(byte_idx, region == HEX_REG_ASCII));
+		return (hex_delete_one(byte_idx));
 	}
 	return (dobeep_msg("Beginning of buffer"));
 }
@@ -937,14 +892,13 @@ static int
 hex_delete_byte_forward(int f, int n)
 {
 	uint64_t byte_idx;
-	int in_ascii;
 	uint64_t rs, re;
 
 	if (hex_region_active(&rs, &re))
 		return (hex_kill_region(f, n));
-	if (hex_byte_under_cursor(&byte_idx, &in_ascii) != TRUE)
+	if (hex_byte_under_cursor(&byte_idx) != TRUE)
 		return (dobeep_msg("Cursor not on a byte"));
-	return (hex_delete_one(byte_idx, in_ascii));
+	return (hex_delete_one(byte_idx));
 }
 
 /* ---------- movement ---------- */
@@ -954,7 +908,6 @@ hex_forw_byte(int f, int n)
 {
 	int byte_in_row, nibble, region;
 	uint64_t row_off, byte_idx;
-	int in_ascii;
 	int reps;
 	unsigned char *data;
 	size_t data_len;
@@ -965,12 +918,10 @@ hex_forw_byte(int f, int n)
 		return (TRUE);
 
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	if (region != HEX_REG_HEX && region != HEX_REG_ASCII) {
+	if (region != HEX_REG_HEX) {
 		curwp->w_doto = HEX_FIRST_HEX_COL;
 		byte_in_row = 0;
-		region = HEX_REG_HEX;
 	}
-	in_ascii = (region == HEX_REG_ASCII);
 	row_off = hex_offset_of_line(curwp->w_dotp);
 	byte_idx = row_off + (uint64_t)byte_in_row;
 
@@ -984,7 +935,7 @@ hex_forw_byte(int f, int n)
 		byte_idx++;
 	}
 	free(data);
-	hex_goto_byte(byte_idx, in_ascii);
+	hex_goto_byte(byte_idx);
 	return (TRUE);
 }
 
@@ -993,7 +944,6 @@ hex_back_byte(int f, int n)
 {
 	int byte_in_row, nibble, region;
 	uint64_t row_off, byte_idx;
-	int in_ascii;
 	int reps;
 
 	if (n < 0)
@@ -1002,12 +952,10 @@ hex_back_byte(int f, int n)
 		return (TRUE);
 
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	if (region != HEX_REG_HEX && region != HEX_REG_ASCII) {
+	if (region != HEX_REG_HEX) {
 		curwp->w_doto = HEX_FIRST_HEX_COL;
 		byte_in_row = 0;
-		region = HEX_REG_HEX;
 	}
-	in_ascii = (region == HEX_REG_ASCII);
 	row_off = hex_offset_of_line(curwp->w_dotp);
 	byte_idx = row_off + (uint64_t)byte_in_row;
 	for (reps = 0; reps < n; reps++) {
@@ -1015,52 +963,115 @@ hex_back_byte(int f, int n)
 			return (dobeep_msg("Beginning of buffer"));
 		byte_idx--;
 	}
-	hex_goto_byte(byte_idx, in_ascii);
+	hex_goto_byte(byte_idx);
 	return (TRUE);
 }
 
 /*
- * C-a: snap to the first byte of the current row, staying in whichever
- * section (hex pairs / ASCII gutter) the cursor was already in.
+ * C-n / C-p: vertical motion that keeps the cursor in the hex section.
+ * The column is preserved as a byte index within the row; on the
+ * destination row the byte index is clamped to the row's byte count.
  */
 static int
-hex_bol(int f, int n)
+hex_forw_line(int f, int n)
 {
 	int byte_in_row, nibble, region;
+	struct line *lp;
+	int row_bytes, idx;
+
+	if (n < 0)
+		return (hex_back_line(f, -n));
 
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	if (region == HEX_REG_ASCII)
-		curwp->w_doto = hex_ascii_col_for_byte(0);
+	if (region != HEX_REG_HEX || byte_in_row < 0)
+		byte_in_row = 0;
+
+	lp = curwp->w_dotp;
+	while (n-- > 0) {
+		if (lforw(lp) == curbp->b_headp) {
+			(void)dobeep_msg("End of buffer");
+			break;
+		}
+		lp = lforw(lp);
+		curwp->w_dotline++;
+	}
+
+	row_bytes = hex_row_byte_count(lp);
+	if (row_bytes == 0)
+		idx = 0;
+	else if (byte_in_row >= row_bytes)
+		idx = row_bytes - 1;
 	else
-		curwp->w_doto = hex_col_for_byte(0, 0);
+		idx = byte_in_row;
+
+	curwp->w_dotp = lp;
+	curwp->w_doto = hex_col_for_byte(idx, 0);
+	curwp->w_rflag |= WFMOVE;
+	return (TRUE);
+}
+
+static int
+hex_back_line(int f, int n)
+{
+	int byte_in_row, nibble, region;
+	struct line *lp;
+	int row_bytes, idx;
+
+	if (n < 0)
+		return (hex_forw_line(f, -n));
+
+	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
+	if (region != HEX_REG_HEX || byte_in_row < 0)
+		byte_in_row = 0;
+
+	lp = curwp->w_dotp;
+	while (n-- > 0) {
+		if (lback(lp) == curbp->b_headp) {
+			(void)dobeep_msg("Beginning of buffer");
+			break;
+		}
+		lp = lback(lp);
+		curwp->w_dotline--;
+	}
+
+	row_bytes = hex_row_byte_count(lp);
+	if (row_bytes == 0)
+		idx = 0;
+	else if (byte_in_row >= row_bytes)
+		idx = row_bytes - 1;
+	else
+		idx = byte_in_row;
+
+	curwp->w_dotp = lp;
+	curwp->w_doto = hex_col_for_byte(idx, 0);
 	curwp->w_rflag |= WFMOVE;
 	return (TRUE);
 }
 
 /*
- * C-e: snap to the last byte of the current row, staying in whichever
- * section the cursor was in. Lands on the low nibble in the hex section
- * (or the corresponding ASCII gutter cell), never into the gutter
- * delimiters or beyond the actual data.
+ * C-a: snap to the first byte of the current row in the hex section.
+ */
+static int
+hex_bol(int f, int n)
+{
+	curwp->w_doto = hex_col_for_byte(0, 0);
+	curwp->w_rflag |= WFMOVE;
+	return (TRUE);
+}
+
+/*
+ * C-e: snap to the last byte of the current row in the hex section,
+ * landing on the low nibble. Never enters the gutter or ASCII column.
  */
 static int
 hex_eol(int f, int n)
 {
-	int byte_in_row, nibble, region;
 	int row_bytes = hex_row_byte_count(curwp->w_dotp);
-	int idx;
 
-	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	if (row_bytes == 0) {
-		curwp->w_doto = (region == HEX_REG_ASCII) ?
-		    hex_ascii_col_for_byte(0) : hex_col_for_byte(0, 0);
-	} else {
-		idx = row_bytes - 1;
-		if (region == HEX_REG_ASCII)
-			curwp->w_doto = hex_ascii_col_for_byte(idx);
-		else
-			curwp->w_doto = hex_col_for_byte(idx, 1);
-	}
+	if (row_bytes == 0)
+		curwp->w_doto = hex_col_for_byte(0, 0);
+	else
+		curwp->w_doto = hex_col_for_byte(row_bytes - 1, 1);
 	curwp->w_rflag |= WFMOVE;
 	return (TRUE);
 }
@@ -1078,8 +1089,7 @@ hex_region_byte_range(uint64_t *start, uint64_t *end)
 		return (dobeep_msg("No mark set"));
 	hex_locate(curwp->w_doto, &br_d, &nb_d, &rg_d);
 	hex_locate(curwp->w_marko, &br_m, &nb_m, &rg_m);
-	if ((rg_d != HEX_REG_HEX && rg_d != HEX_REG_ASCII) ||
-	    (rg_m != HEX_REG_HEX && rg_m != HEX_REG_ASCII))
+	if (rg_d != HEX_REG_HEX || rg_m != HEX_REG_HEX)
 		return (dobeep_msg("Mark or point not on a byte"));
 	off_d = hex_offset_of_line(curwp->w_dotp);
 	off_m = hex_offset_of_line(curwp->w_markp);
@@ -1111,8 +1121,7 @@ hex_region_active(uint64_t *start, uint64_t *end)
 		return (FALSE);
 	hex_locate(curwp->w_doto, &br_d, &nb_d, &rg_d);
 	hex_locate(curwp->w_marko, &br_m, &nb_m, &rg_m);
-	if ((rg_d != HEX_REG_HEX && rg_d != HEX_REG_ASCII) ||
-	    (rg_m != HEX_REG_HEX && rg_m != HEX_REG_ASCII))
+	if (rg_d != HEX_REG_HEX || rg_m != HEX_REG_HEX)
 		return (FALSE);
 	b_d = hex_offset_of_line(curwp->w_dotp) + (uint64_t)br_d;
 	b_m = hex_offset_of_line(curwp->w_markp) + (uint64_t)br_m;
@@ -1159,8 +1168,6 @@ hex_kill_region(int f, int n)
 	uint64_t start, end, i;
 	unsigned char *data;
 	size_t data_len;
-	int in_ascii = FALSE;
-	int br, nb, rg;
 
 	if (curbp->b_flag & BFREADONLY)
 		return (dobeep_msg("Buffer is read only"));
@@ -1185,10 +1192,6 @@ hex_kill_region(int f, int n)
 		memmove(data + start, data + end, data_len - (size_t)end);
 	data_len -= (size_t)(end - start);
 
-	hex_locate(curwp->w_doto, &br, &nb, &rg);
-	if (rg == HEX_REG_ASCII)
-		in_ascii = TRUE;
-
 	undo_boundary_enable(FFRAND, 0);
 	if (hex_install_layout(curbp, data, data_len, TRUE) != TRUE) {
 		free(data);
@@ -1203,9 +1206,9 @@ hex_kill_region(int f, int n)
 		curwp->w_doto = HEX_FIRST_HEX_COL;
 		curwp->w_dotline = 1;
 	} else if (start < data_len)
-		hex_goto_byte(start, in_ascii);
+		hex_goto_byte(start);
 	else
-		hex_goto_byte(data_len - 1, in_ascii);
+		hex_goto_byte(data_len - 1);
 	(void)clearmark(FFARG, 0);
 	curwp->w_rflag |= WFFULL | WFMOVE;
 
@@ -1219,7 +1222,6 @@ hex_yank(int f, int n)
 {
 	int byte_in_row, nibble, region;
 	uint64_t byte_idx;
-	int in_ascii;
 	int kc, ki, kn = 0;
 	unsigned char *insert_data;
 	size_t insert_len = 0;
@@ -1244,11 +1246,10 @@ hex_yank(int f, int n)
 	}
 
 	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
-	if (region != HEX_REG_HEX && region != HEX_REG_ASCII) {
+	if (region != HEX_REG_HEX) {
 		free(insert_data);
 		return (dobeep_msg("Cursor not on a byte"));
 	}
-	in_ascii = (region == HEX_REG_ASCII);
 	byte_idx = hex_offset_of_line(curwp->w_dotp) + (uint64_t)byte_in_row;
 
 	if (hex_collect_bytes(curbp, &data, &data_len) != TRUE) {
@@ -1282,7 +1283,7 @@ hex_yank(int f, int n)
 	undo_boundary_enable(FFRAND, 1);
 
 	curbp->b_flag |= BFCHG;
-	hex_goto_byte(byte_idx + insert_len, in_ascii);
+	hex_goto_byte(byte_idx + insert_len);
 	curwp->w_rflag |= WFFULL | WFMOVE;
 	free(combined);
 	ewprintf("Yanked %ld byte(s)", (long)insert_len);
