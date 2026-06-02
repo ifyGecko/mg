@@ -670,6 +670,30 @@ If an argument is present, then
 it is the line number, else prompt for a line number to use.
 .It Ic help-help
 Prompts for one of (a)propos, (b)indings, des(c)ribe key briefly.
+.It Ic hex-mode
+Toggle the current buffer between raw text and a classic
+16-byte-per-row hex-dump layout (offset, hex pairs, and an editable
+ASCII gutter).
+While the buffer is in hex-mode, typing a hex digit replaces the
+nibble under the cursor and updates the matching ASCII glyph;
+typing a printable character in the ASCII gutter rewrites both the
+hex pair and the gutter.
+Backspace and
+.Ic delete-char
+remove the byte under the cursor and reflow the layout.
+.Ic forward-char
+and
+.Ic backward-char
+snap to byte boundaries.
+.Ic kill-region ,
+.Ic copy-region-as-kill ,
+and
+.Ic yank
+operate on raw bytes (M-w and C-w copy/cut the bytes that the marked
+region covers; C-y inserts the kill ring bytes into the layout).
+Saving the buffer writes the raw bytes back to disk, so a binary file
+opened with hex-mode round-trips correctly.
+Running hex-mode again on a hex buffer reverts it to raw view.
 .It Ic insert
 Insert a string, mainly for use from macros.
 .It Ic insert-buffer

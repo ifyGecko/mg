@@ -659,10 +659,13 @@ makebkfile(int f, int n)
 int
 writeout(FILE ** ffp, struct buffer *bp, char *fn)
 {
+	extern int	 hex_buffer_is_hex(struct buffer *);
+	extern int	 hex_write_raw(struct buffer *, FILE *);
 	struct stat	 statbuf;
 	struct line	*lpend;
 	int		 s, eobnl;
 	char		 dp[NFILEN];
+	int		 is_hex;
 
 	if (stat(fn, &statbuf) == -1 && errno == ENOENT) {
 		errno = 0;
@@ -678,17 +681,23 @@ writeout(FILE ** ffp, struct buffer *bp, char *fn)
 			return (FIOERR);
 		}
         }
-	lpend = bp->b_headp;
+	is_hex = hex_buffer_is_hex(bp);
 	eobnl = 0;
-	if (llength(lback(lpend)) != 0) {
-		eobnl = eyorn("No newline at end of file, add one");
-		if (eobnl != TRUE && eobnl != FALSE)
-			return (eobnl); /* abort */
+	if (!is_hex) {
+		lpend = bp->b_headp;
+		if (llength(lback(lpend)) != 0) {
+			eobnl = eyorn("No newline at end of file, add one");
+			if (eobnl != TRUE && eobnl != FALSE)
+				return (eobnl); /* abort */
+		}
 	}
 	/* open writes message */
 	if ((s = ffwopen(ffp, fn, bp)) != FIOSUC)
 		return (FALSE);
-	s = ffputbuf(*ffp, bp, eobnl);
+	if (is_hex)
+		s = hex_write_raw(bp, *ffp);
+	else
+		s = ffputbuf(*ffp, bp, eobnl);
 	if (s == FIOSUC) {
 		/* no write error */
 		s = ffclose(*ffp, bp);
