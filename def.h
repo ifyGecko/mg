@@ -40,6 +40,7 @@ typedef int	(*PF)(int, int);	/* generally useful type */
 #define NXNAME	64		/* Length, extended command.	 */
 #define NKNAME	20		/* Length, key names.		 */
 #define NTIME	50		/* Length, timestamp string.	 */
+#define PREFIXLENGTH 40		/* Length, prefix/comment string.*/
 
 /*
  * Universal.
@@ -297,6 +298,7 @@ struct buffer {
 	int		 b_dotline;	/* Line number of dot */
 	int		 b_markline;	/* Line number of mark */
 	int		 b_lines;	/* Number of lines in file	*/
+	char		 b_cmtstr[PREFIXLENGTH]; /* per-buffer comment string */
 };
 #define b_bufp	b_list.l_p.x_bp
 #define b_bname b_list.l_name
@@ -665,6 +667,8 @@ int		 upperregion(int, int);
 int		 prefixregion(int, int);
 int		 untabifyregion(int, int);
 int		 setprefix(int, int);
+int		 comment_region(int, int);
+int		 uncomment_region(int, int);
 int		 region_get_data(struct region *, char *, int);
 void		 region_put_data(const char *, int);
 int		 markbuffer(int, int);

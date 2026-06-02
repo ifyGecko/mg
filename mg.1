@@ -471,6 +471,21 @@ See also
 .Ic global-wd-mode .
 .It Ic column-number-mode
 Toggle whether the column number is displayed in the modeline.
+.It Ic comment-region
+Comment out every line in the region by prepending a comment string.
+When invoked in c-mode the comment string defaults to
+.Dq // .
+Otherwise the user is prompted for the comment syntax to use
+(for example
+.Dq \&;
+for lisp code).
+The chosen comment string is remembered per-buffer and reused by
+subsequent invocations of
+.Ic comment-region
+and
+.Ic uncomment-region .
+With a prefix argument, prompts again and overwrites the stored value.
+If the mark is not set, no region exists and an error is reported.
 .It Ic copy-region-as-kill
 Copy all of the characters in the region to the kill buffer,
 clearing the mark afterwards.
@@ -1106,6 +1121,20 @@ be moved
 paragraphs forward.
 .It Ic transpose-words
 Transpose adjacent words.
+.It Ic uncomment-region
+Remove the buffer's comment string from the beginning of every line in
+the region.
+Leading whitespace on each line is skipped before matching; lines that
+do not begin (after any whitespace) with the comment string are left
+unchanged.
+The comment string is the one previously chosen by
+.Ic comment-region
+or
+.Ic uncomment-region
+for this buffer; if none has been set, the user is prompted as for
+.Ic comment-region .
+With a prefix argument, prompts again and overwrites the stored value.
+If the mark is not set, no region exists and an error is reported.
 .It Ic undo
 Undo the most recent action.
 If invoked again without an intervening command,

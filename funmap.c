@@ -63,6 +63,7 @@ static struct funmap functnames[] = {
 	{changedir, "cd", 1},
 	{clearmark, "clear-mark", 0},
 	{colnotoggle, "column-number-mode", 0},
+	{comment_region, "comment-region", 0},
 	{copyregion, "copy-region-as-kill", 0},
 #ifdef	REGEX
 	{cntmatchlines, "count-matches", 1},
@@ -229,6 +230,7 @@ static struct funmap functnames[] = {
 	{twiddle, "transpose-chars", 0},
 	{transposepara, "transpose-paragraphs", 0},
 	{transposeword, "transpose-words", 0},
+	{uncomment_region, "uncomment-region", 0},
 	{undo, "undo", 0},
 	{undo_add_boundary, "undo-boundary", 0},
 	{undo_boundary_enable, "undo-boundary-toggle", 0},

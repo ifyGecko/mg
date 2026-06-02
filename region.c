@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "def.h"
+#include "kbd.h"
 
 #define TIMEOUT 10000
 
@@ -391,7 +392,6 @@ setsize(struct region *rp, RSIZE size)
 	return (TRUE);
 }
 
-#define PREFIXLENGTH 40
 static char	prefix_string[PREFIXLENGTH] = {'>', '\0'};
 
 /*
@@ -468,6 +468,173 @@ setprefix(int f, int n)
 	} else
 		retval = FALSE;
 	return (retval);
+}
+
+/*
+ * Make sure the current buffer has a comment string defined.  If one is
+ * already set and force_prompt is FALSE, do nothing.  Otherwise:
+ *   - in c-mode (and not force_prompt), default to "//".
+ *   - elsewhere, prompt the user with the emacs message and store the
+ *     answer in curbp->b_cmtstr.
+ * Returns TRUE on success, ABORT on C-g, FALSE on empty input.
+ */
+static int
+set_cmtstr(int force_prompt)
+{
+	char	 buf[PREFIXLENGTH], *rep;
+	int	 i, in_cmode;
+
+	if (!force_prompt && curbp->b_cmtstr[0] != '\0')
+		return (TRUE);
+
+	if (!force_prompt) {
+		in_cmode = FALSE;
+		for (i = 0; i <= curbp->b_nmodes; i++) {
+			if (curbp->b_modes[i] != NULL &&
+			    strcmp(curbp->b_modes[i]->p_name, "c") == 0) {
+				in_cmode = TRUE;
+				break;
+			}
+		}
+		if (in_cmode) {
+			(void)strlcpy(curbp->b_cmtstr, "//",
+			    sizeof(curbp->b_cmtstr));
+			return (TRUE);
+		}
+	}
+
+	rep = eread("No comment syntax is defined.  Use: ", buf, sizeof(buf),
+	    EFNEW | EFCR);
+	if (rep == NULL)
+		return (ABORT);
+	if (rep[0] == '\0')
+		return (FALSE);
+	(void)strlcpy(curbp->b_cmtstr, rep, sizeof(curbp->b_cmtstr));
+	return (TRUE);
+}
+
+/*
+ * Comment out every line in the region by prepending the buffer's
+ * comment string.  In c-mode the default is "//"; in any other mode the
+ * user is prompted once and the answer is remembered per-buffer.  A
+ * prefix argument forces re-prompting.  If the mark is not set, no
+ * region exists and an error is reported.  Leaves dot at the beginning
+ * of the line after the end of the region.
+ */
+int
+comment_region(int f, int n)
+{
+	struct line	*first, *last;
+	struct region	 region;
+	const char	*p;
+	int		 nline, s;
+
+	if ((s = checkdirty(curbp)) != TRUE)
+		return (s);
+	if (curbp->b_flag & BFREADONLY) {
+		dobeep();
+		ewprintf("Buffer is read-only");
+		return (FALSE);
+	}
+	if (curwp->w_markp == NULL) {
+		dobeep();
+		ewprintf("The mark is not set now, so there is no region");
+		return (FALSE);
+	}
+	if ((s = set_cmtstr(f == TRUE)) != TRUE)
+		return (s);
+
+	if ((s = getregion(&region)) != TRUE)
+		return (s);
+	first = region.r_linep;
+	last = (first == curwp->w_dotp) ? curwp->w_markp : curwp->w_dotp;
+	for (nline = 1; first != last; nline++)
+		first = lforw(first);
+
+	curwp->w_dotp = region.r_linep;
+	curwp->w_doto = region.r_offset;
+	curwp->w_dotline = region.r_lineno;
+
+	while (nline--) {
+		(void)gotobol(FFRAND, 1);
+		for (p = curbp->b_cmtstr; *p; p++)
+			(void)linsert(1, *p);
+		(void)forwline(FFRAND, 1);
+	}
+	(void)gotobol(FFRAND, 1);
+	clearmark(FFARG, 0);
+	return (TRUE);
+}
+
+/*
+ * Uncomment every line in the region by removing the buffer's comment
+ * string.  Each line's leading whitespace is skipped; if the next
+ * characters match the comment string they are deleted, otherwise the
+ * line is left unchanged.  If no comment string has been set for this
+ * buffer, prompt for it (same as comment-region).  A prefix argument
+ * forces re-prompting.
+ */
+int
+uncomment_region(int f, int n)
+{
+	struct line	*first, *last, *lp;
+	struct region	 region;
+	size_t		 clen;
+	int		 i, nline, off, s;
+
+	if ((s = checkdirty(curbp)) != TRUE)
+		return (s);
+	if (curbp->b_flag & BFREADONLY) {
+		dobeep();
+		ewprintf("Buffer is read-only");
+		return (FALSE);
+	}
+	if (curwp->w_markp == NULL) {
+		dobeep();
+		ewprintf("The mark is not set now, so there is no region");
+		return (FALSE);
+	}
+	if ((s = set_cmtstr(f == TRUE)) != TRUE)
+		return (s);
+
+	clen = strlen(curbp->b_cmtstr);
+	if (clen == 0)
+		return (FALSE);
+
+	if ((s = getregion(&region)) != TRUE)
+		return (s);
+	first = region.r_linep;
+	last = (first == curwp->w_dotp) ? curwp->w_markp : curwp->w_dotp;
+	for (nline = 1; first != last; nline++)
+		first = lforw(first);
+
+	curwp->w_dotp = region.r_linep;
+	curwp->w_doto = region.r_offset;
+	curwp->w_dotline = region.r_lineno;
+
+	while (nline--) {
+		(void)gotobol(FFRAND, 1);
+		lp = curwp->w_dotp;
+		off = 0;
+		while (off < llength(lp) &&
+		    (lgetc(lp, off) == ' ' || lgetc(lp, off) == '\t'))
+			off++;
+		if ((size_t)(llength(lp) - off) >= clen) {
+			for (i = 0; (size_t)i < clen; i++) {
+				if (lgetc(lp, off + i) !=
+				    (unsigned char)curbp->b_cmtstr[i])
+					break;
+			}
+			if ((size_t)i == clen) {
+				curwp->w_doto = off;
+				(void)ldelete((RSIZE)clen, KNONE);
+			}
+		}
+		(void)forwline(FFRAND, 1);
+	}
+	(void)gotobol(FFRAND, 1);
+	clearmark(FFARG, 0);
+	return (TRUE);
 }
 
 int
