@@ -473,8 +473,8 @@ clearmark(int f, int n)
 
 	curwp->w_markp = NULL;
 	curwp->w_marko = 0;
-	curwp->w_markline = 0;
-	curwp->w_rflag |= WFFULL;
+	curbp->b_markline = 0;
+	curwp->w_rflag |= WFFULL;	/* repaint to drop stale CHILIGHT */
 
 	return (TRUE);
 }

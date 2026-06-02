@@ -74,6 +74,7 @@ static int  hex_install_layout(struct buffer *, const unsigned char *, size_t, i
 static int  hex_byte_under_cursor(uint64_t *, int *);
 static void hex_goto_byte(uint64_t, int);
 static int  hex_delete_one(uint64_t, int);
+static int  hex_region_active(uint64_t *, uint64_t *);
 
 /* Range 0x02..0x19 inclusive: control-key bindings. */
 static PF hex_ctl_pf[] = {
@@ -903,6 +904,10 @@ hex_delete_byte(int f, int n)
 	int in_ascii;
 	int byte_in_row, nibble, region;
 	uint64_t row_off;
+	uint64_t rs, re;
+
+	if (hex_region_active(&rs, &re))
+		return (hex_kill_region(f, n));
 
 	if (hex_byte_under_cursor(&byte_idx, &in_ascii) == TRUE) {
 		if (byte_idx == 0)
@@ -928,7 +933,10 @@ hex_delete_byte_forward(int f, int n)
 {
 	uint64_t byte_idx;
 	int in_ascii;
+	uint64_t rs, re;
 
+	if (hex_region_active(&rs, &re))
+		return (hex_kill_region(f, n));
 	if (hex_byte_under_cursor(&byte_idx, &in_ascii) != TRUE)
 		return (dobeep_msg("Cursor not on a byte"));
 	return (hex_delete_one(byte_idx, in_ascii));
@@ -1036,6 +1044,34 @@ hex_region_byte_range(uint64_t *start, uint64_t *end)
 	return (TRUE);
 }
 
+/*
+ * Region-active probe: silent (no beep) variant of hex_region_byte_range
+ * for callers that want to opportunistically treat backspace/delete as a
+ * region kill when a non-empty byte region is active.
+ */
+static int
+hex_region_active(uint64_t *start, uint64_t *end)
+{
+	int br_d, nb_d, rg_d;
+	int br_m, nb_m, rg_m;
+	uint64_t b_d, b_m;
+
+	if (curwp->w_markp == NULL)
+		return (FALSE);
+	hex_locate(curwp->w_doto, &br_d, &nb_d, &rg_d);
+	hex_locate(curwp->w_marko, &br_m, &nb_m, &rg_m);
+	if ((rg_d != HEX_REG_HEX && rg_d != HEX_REG_ASCII) ||
+	    (rg_m != HEX_REG_HEX && rg_m != HEX_REG_ASCII))
+		return (FALSE);
+	b_d = hex_offset_of_line(curwp->w_dotp) + (uint64_t)br_d;
+	b_m = hex_offset_of_line(curwp->w_markp) + (uint64_t)br_m;
+	if (b_d == b_m)
+		return (FALSE);
+	*start = (b_m < b_d) ? b_m : b_d;
+	*end   = (b_m < b_d) ? b_d : b_m;
+	return (TRUE);
+}
+
 static int
 hex_copy_region(int f, int n)
 {
@@ -1061,7 +1097,7 @@ hex_copy_region(int f, int n)
 		}
 	}
 	free(data);
-	ewprintf("Copied %llu byte(s)", (unsigned long long)(end - start));
+	ewprintf("Copied %ld byte(s)", (long)(end - start));
 	return (TRUE);
 }
 
@@ -1122,7 +1158,7 @@ hex_kill_region(int f, int n)
 	curwp->w_marko = 0;
 	curwp->w_rflag |= WFFULL | WFMOVE;
 
-	ewprintf("Killed %llu byte(s)", (unsigned long long)(end - start));
+	ewprintf("Killed %ld byte(s)", (long)(end - start));
 	free(data);
 	return (TRUE);
 }
@@ -1198,7 +1234,7 @@ hex_yank(int f, int n)
 	hex_goto_byte(byte_idx + insert_len, in_ascii);
 	curwp->w_rflag |= WFFULL | WFMOVE;
 	free(combined);
-	ewprintf("Yanked %llu byte(s)", (unsigned long long)insert_len);
+	ewprintf("Yanked %ld byte(s)", (long)insert_len);
 	return (TRUE);
 }
 
