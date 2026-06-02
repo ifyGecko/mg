@@ -51,6 +51,8 @@ static int hex_delete_byte(int, int);
 static int hex_delete_byte_forward(int, int);
 static int hex_forw_byte(int, int);
 static int hex_back_byte(int, int);
+static int hex_bol(int, int);
+static int hex_eol(int, int);
 static int hex_kill_region(int, int);
 static int hex_copy_region(int, int);
 static int hex_yank(int, int);
@@ -76,12 +78,13 @@ static void hex_goto_byte(uint64_t, int);
 static int  hex_delete_one(uint64_t, int);
 static int  hex_region_active(uint64_t *, uint64_t *);
 
-/* Range 0x02..0x19 inclusive: control-key bindings. */
+/* Range 0x01..0x19 inclusive: control-key bindings. */
 static PF hex_ctl_pf[] = {
+	hex_bol,			/* 0x01  C-a */
 	hex_back_byte,			/* 0x02  C-b */
 	rescan,				/* 0x03  C-c */
 	hex_delete_byte_forward,	/* 0x04  C-d */
-	rescan,				/* 0x05  C-e (gotoeol fine) */
+	hex_eol,			/* 0x05  C-e */
 	hex_forw_byte,			/* 0x06  C-f */
 	rescan,				/* 0x07  C-g */
 	hex_delete_byte,		/* 0x08  C-h / BS */
@@ -150,7 +153,7 @@ static struct KEYMAPE (4) hexmodemap = {
 	4,
 	rescan,
 	{
-		{ 0x02, 0x19, hex_ctl_pf,   NULL },
+		{ 0x01, 0x19, hex_ctl_pf,   NULL },
 		{ 0x1B, 0x1B, hex_esc_pf,   (KEYMAP *)&hex_meta_map },
 		{ 0x20, 0x7E, hex_print_pf, NULL },
 		{ 0x7F, 0x7F, hex_del_pf,   NULL }
@@ -166,6 +169,8 @@ hexmode_init(void)
 	funmap_add(hex_delete_byte_forward, "hex-delete-byte-forward", 0);
 	funmap_add(hex_forw_byte, "hex-forw-byte", 0);
 	funmap_add(hex_back_byte, "hex-back-byte", 0);
+	funmap_add(hex_bol, "hex-beginning-of-line", 0);
+	funmap_add(hex_eol, "hex-end-of-line", 0);
 	funmap_add(hex_kill_region, "hex-kill-region", 0);
 	funmap_add(hex_copy_region, "hex-copy-region", 0);
 	funmap_add(hex_yank, "hex-yank", 0);
@@ -1014,6 +1019,52 @@ hex_back_byte(int f, int n)
 	return (TRUE);
 }
 
+/*
+ * C-a: snap to the first byte of the current row, staying in whichever
+ * section (hex pairs / ASCII gutter) the cursor was already in.
+ */
+static int
+hex_bol(int f, int n)
+{
+	int byte_in_row, nibble, region;
+
+	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
+	if (region == HEX_REG_ASCII)
+		curwp->w_doto = hex_ascii_col_for_byte(0);
+	else
+		curwp->w_doto = hex_col_for_byte(0, 0);
+	curwp->w_rflag |= WFMOVE;
+	return (TRUE);
+}
+
+/*
+ * C-e: snap to the last byte of the current row, staying in whichever
+ * section the cursor was in. Lands on the low nibble in the hex section
+ * (or the corresponding ASCII gutter cell), never into the gutter
+ * delimiters or beyond the actual data.
+ */
+static int
+hex_eol(int f, int n)
+{
+	int byte_in_row, nibble, region;
+	int row_bytes = hex_row_byte_count(curwp->w_dotp);
+	int idx;
+
+	hex_locate(curwp->w_doto, &byte_in_row, &nibble, &region);
+	if (row_bytes == 0) {
+		curwp->w_doto = (region == HEX_REG_ASCII) ?
+		    hex_ascii_col_for_byte(0) : hex_col_for_byte(0, 0);
+	} else {
+		idx = row_bytes - 1;
+		if (region == HEX_REG_ASCII)
+			curwp->w_doto = hex_ascii_col_for_byte(idx);
+		else
+			curwp->w_doto = hex_col_for_byte(idx, 1);
+	}
+	curwp->w_rflag |= WFMOVE;
+	return (TRUE);
+}
+
 /* ---------- byte-aware kill/copy/yank ---------- */
 
 static int
@@ -1097,6 +1148,7 @@ hex_copy_region(int f, int n)
 		}
 	}
 	free(data);
+	(void)clearmark(FFARG, 0);
 	ewprintf("Copied %ld byte(s)", (long)(end - start));
 	return (TRUE);
 }
@@ -1154,8 +1206,7 @@ hex_kill_region(int f, int n)
 		hex_goto_byte(start, in_ascii);
 	else
 		hex_goto_byte(data_len - 1, in_ascii);
-	curwp->w_markp = NULL;
-	curwp->w_marko = 0;
+	(void)clearmark(FFARG, 0);
 	curwp->w_rflag |= WFFULL | WFMOVE;
 
 	ewprintf("Killed %ld byte(s)", (long)(end - start));
