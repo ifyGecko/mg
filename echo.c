@@ -33,8 +33,31 @@ static void	 eputl(long, int);
 static void	 eputs(const char *);
 static void	 eputc(char);
 static struct list	*copy_list(struct list *);
+static void	 eredraw(const char *, int, int);
+static void	 eml_reset(void);
 
 int		epresf = FALSE;		/* stuff in echo line flag */
+
+/*
+ * Multi-row echo-line state.  The echo line normally occupies row
+ * nrow - 1 only.  When the rendered prompt + input would exceed ncol,
+ * the area grows upward, taking rows from (nrow - eml_rows) through
+ * (nrow - 1).  eml_rows is capped at nrow/2 so the buffer area is
+ * never fully eclipsed.  When the area shrinks, sgarbf is asserted so
+ * update() repaints the formerly used rows with their underlying
+ * window content.
+ *
+ * eml_prompt holds the fully formatted prompt (control characters
+ * already expanded as ^X) so that veread can repaint from a stable
+ * source after every keystroke.  Capture into it is done by setting
+ * eml_capture; in that mode eputc appends to eml_prompt instead of
+ * writing to the terminal.
+ */
+#define EML_PROMPT_MAX	1024
+static int	 eml_rows = 1;
+static int	 eml_capture;
+static char	 eml_prompt[EML_PROMPT_MAX];
+static int	 eml_promptlen;
 
 /*
  * Erase the echo line.
@@ -42,6 +65,9 @@ int		epresf = FALSE;		/* stuff in echo line flag */
 void
 eerase(void)
 {
+	eml_reset();
+	eml_prompt[0] = '\0';
+	eml_promptlen = 0;
 	ttcolor(CTEXT);
 	ttmove(nrow - 1, 0);
 	tteeol();
@@ -196,7 +222,6 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 	struct buffer	*bp;			/* completion list buffer */
 	struct mgwin	*wp;			/* window for compl list */
 	int	 match;			/* esc match found */
-	int	 cc, rr;		/* saved ttcol, ttrow */
 	char	*ret;			/* return value */
 
 	static char emptyval[] = "";	/* XXX hackish way to return err msg*/
@@ -216,31 +241,56 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 	ml = mr = esc = 0;
 	cplflag = FALSE;
 
+	/*
+	 * Capture the formatted prompt into eml_prompt so that eredraw can
+	 * repaint the echo area from scratch after every keystroke.  When the
+	 * previous output already ended on the echo line and the caller did
+	 * not request a fresh prompt, append a separating space to whatever
+	 * is already captured (preserves the legacy "continuation" behavior).
+	 */
+	ttcolor(CTEXT);
 	if ((flag & EFNEW) != 0 || ttrow != nrow - 1) {
-		ttcolor(CTEXT);
-		ttmove(nrow - 1, 0);
-		epresf = TRUE;
-	} else
+		eml_prompt[0] = '\0';
+		eml_promptlen = 0;
+	} else {
+		eml_capture = TRUE;
 		eputc(' ');
+		eml_capture = FALSE;
+	}
+	eml_capture = TRUE;
 	eformat(fp, ap);
+	eml_capture = FALSE;
+
 	if ((flag & EFDEF) != 0) {
 		if (buf == NULL)
 			return (NULL);
-		eputs(buf);
-		epos = cpos += strlen(buf);
+		epos = cpos = strlen(buf);
 	}
-	tteeol();
-	ttflush();
+	eredraw(buf, epos, cpos);
+
 	for (;;) {
 		c = getkey(FALSE);
 		if ((flag & EFAUTO) != 0 && c == CCHR('I')) {
 			if (cplflag == TRUE) {
 				complt_list(flag, buf, cpos);
 				cwin = TRUE;
-			} else if (complt(flag, c, buf, nbuf, epos, &i) == TRUE) {
+				eredraw(buf, epos, cpos);
+			} else if (complt(flag, c, buf, nbuf, epos, &i)
+			    == TRUE) {
 				cplflag = TRUE;
-				epos += i;
-				cpos = epos;
+				if (i > 0) {
+					epos += i;
+					cpos = epos;
+					eredraw(buf, epos, cpos);
+				}
+				/*
+				 * When i == 0 complt has either matched
+				 * exactly (no extension) or printed a
+				 * transient " [No match]"/" [Ambiguous...]"
+				 * message at the cursor.  Either way, leave
+				 * the screen alone here so the message stays
+				 * visible until the next keystroke.
+				 */
 			}
 			continue;
 		}
@@ -274,51 +324,31 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 		}
 		switch (c) {
 		case CCHR('A'): /* start of line */
-			while (cpos > 0) {
-				if (ISCTRL(buf[--cpos]) != FALSE) {
-					ttputc('\b');
-					--ttcol;
-				}
-				ttputc('\b');
-				--ttcol;
-			}
-			ttflush();
+			cpos = 0;
+			eredraw(buf, epos, cpos);
 			break;
 		case CCHR('D'):
 			if (cpos != epos) {
-				tteeol();
-				epos--;
-				rr = ttrow;
-				cc = ttcol;
-				for (i = cpos; i < epos; i++) {
+				for (i = cpos; i < epos - 1; i++)
 					buf[i] = buf[i + 1];
-					eputc(buf[i]);
-				}
-				ttmove(rr, cc);
-				ttflush();
+				epos--;
+				eredraw(buf, epos, cpos);
 			}
 			break;
 		case CCHR('E'): /* end of line */
-			while (cpos < epos) {
-				eputc(buf[cpos++]);
-			}
-			ttflush();
+			cpos = epos;
+			eredraw(buf, epos, cpos);
 			break;
 		case CCHR('B'): /* back */
 			if (cpos > 0) {
-				if (ISCTRL(buf[--cpos]) != FALSE) {
-					ttputc('\b');
-					--ttcol;
-				}
-				ttputc('\b');
-				--ttcol;
-				ttflush();
+				cpos--;
+				eredraw(buf, epos, cpos);
 			}
 			break;
 		case CCHR('F'): /* forw */
 			if (cpos < epos) {
-				eputc(buf[cpos++]);
-				ttflush();
+				cpos++;
+				eredraw(buf, epos, cpos);
 			}
 			break;
 		case CCHR('Y'): /* yank from kill buffer */
@@ -343,22 +373,15 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 					buf[t] = buf[t - 1];
 				buf[cpos++] = (char)y;
 				epos++;
-				eputc((char)y);
-				cc = ttcol;
-				rr = ttrow;
-				for (t = cpos; t < epos; t++)
-					eputc(buf[t]);
-				ttmove(rr, cc);
 			}
-			ttflush();
+			eredraw(buf, epos, cpos);
 			break;
 		case CCHR('K'): /* copy here-EOL to kill buffer */
 			kdelete();
 			for (i = cpos; i < epos; i++)
 				kinsert(buf[i], KFORW);
-			tteeol();
 			epos = cpos;
-			ttflush();
+			eredraw(buf, epos, cpos);
 			break;
 		case CCHR('['):
 			ml = mr = esc = 1;
@@ -371,14 +394,18 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 			if (epos == 0 && !(flag & EFNUL)) {
 				(void)ctrlg(FFRAND, 0);
 				ttflush();
+				eml_reset();
 				return (NULL);
 			}
 			if ((flag & EFFUNC) != 0) {
 				if (complt(flag, c, buf, nbuf, epos, &i)
 				    == FALSE)
 					continue;
-				if (i > 0)
+				if (i > 0) {
 					epos += i;
+					cpos = epos;
+					eredraw(buf, epos, cpos);
+				}
 			}
 			buf[epos] = '\0';
 			if ((flag & EFCR) != 0) {
@@ -399,7 +426,6 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 			ret = buf;
 			goto done;
 		case CCHR('G'):			/* bell, abort */
-			eputc(CCHR('G'));
 			(void)ctrlg(FFRAND, 0);
 			ttflush();
 			ret = NULL;
@@ -407,75 +433,33 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 		case CCHR('H'):			/* rubout, erase */
 		case CCHR('?'):
 			if (cpos != 0) {
-				y = buf[--cpos];
-				epos--;
-				ttputc('\b');
-				ttcol--;
-				if (ISCTRL(y) != FALSE) {
-					ttputc('\b');
-					ttcol--;
-				}
-				rr = ttrow;
-				cc = ttcol;
-				for (i = cpos; i < epos; i++) {
+				cpos--;
+				for (i = cpos; i < epos - 1; i++)
 					buf[i] = buf[i + 1];
-					eputc(buf[i]);
-				}
-				ttputc(' ');
-				if (ISCTRL(y) != FALSE) {
-					ttputc(' ');
-					ttputc('\b');
-				}
-				ttputc('\b');
-				ttmove(rr, cc);
-				ttflush();
+				epos--;
+				eredraw(buf, epos, cpos);
 			}
 			break;
 		case CCHR('X'):			/* kill line */
 		case CCHR('U'):
-			while (cpos != 0) {
-				ttputc('\b');
-				ttputc(' ');
-				ttputc('\b');
-				--ttcol;
-				if (ISCTRL(buf[--cpos]) != FALSE) {
-					ttputc('\b');
-					ttputc(' ');
-					ttputc('\b');
-					--ttcol;
-				}
-				epos--;
-			}
-			ttflush();
+			cpos = 0;
+			epos = 0;
+			eredraw(buf, epos, cpos);
 			break;
 		case CCHR('W'):			/* kill to beginning of word */
-			while ((cpos > 0) && !ISWORD(buf[cpos - 1])) {
-				ttputc('\b');
-				ttputc(' ');
-				ttputc('\b');
-				--ttcol;
-				if (ISCTRL(buf[--cpos]) != FALSE) {
-					ttputc('\b');
-					ttputc(' ');
-					ttputc('\b');
-					--ttcol;
-				}
-				epos--;
-			}
-			while ((cpos > 0) && ISWORD(buf[cpos - 1])) {
-				ttputc('\b');
-				ttputc(' ');
-				ttputc('\b');
-				--ttcol;
-				if (ISCTRL(buf[--cpos]) != FALSE) {
-					ttputc('\b');
-					ttputc(' ');
-					ttputc('\b');
-					--ttcol;
-				}
-				epos--;
-			}
-			ttflush();
+		{
+			int oldcpos = cpos;
+			int removed;
+			while ((cpos > 0) && !ISWORD(buf[cpos - 1]))
+				cpos--;
+			while ((cpos > 0) && ISWORD(buf[cpos - 1]))
+				cpos--;
+			removed = oldcpos - cpos;
+			for (i = cpos; i + removed < epos; i++)
+				buf[i] = buf[i + removed];
+			epos -= removed;
+			eredraw(buf, epos, cpos);
+		}
 			break;
 		case CCHR('\\'):
 		case CCHR('Q'):			/* quote next */
@@ -499,19 +483,14 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 				buf[i] = buf[i - 1];
 			buf[cpos++] = (char)c;
 			epos++;
-			eputc((char)c);
-			cc = ttcol;
-			rr = ttrow;
-			for (i = cpos; i < epos; i++)
-				eputc(buf[i]);
-			ttmove(rr, cc);
-			ttflush();
+			eredraw(buf, epos, cpos);
 		}
 
 skipkey:	/* ignore key press */
 ;
 	}
 done:
+	eml_reset();
 	if (cwin == TRUE) {
 		/* blow away cpltion window */
 		bp = bfind("*Completions*", TRUE);
@@ -598,10 +577,14 @@ complt(int flags, int c, char *buf, size_t nbuf, int cpos, int *nx)
 			nxtra = 1; /* ??? */
 		for (i = 0; i < nxtra && cpos < nbuf; ++i) {
 			buf[cpos] = lh2->l_name[cpos];
-			eputc(buf[cpos++]);
+			cpos++;
 		}
 		/* XXX should grow nbuf */
-		ttflush();
+		/*
+		 * Don't paint the extension chars here; the caller (veread)
+		 * re-renders the whole echo area via eredraw, which is wrap-
+		 * aware and keeps cursor/row state coherent for long inputs.
+		 */
 		free_file_list(wholelist);
 		*nx = nxtra;
 		if (nxtra < 0 && c != CCHR('M')) /* exact */
@@ -828,14 +811,16 @@ ewprintf(const char *fmt, ...)
 	if (inmacro)
 		return;
 
+	eml_prompt[0] = '\0';
+	eml_promptlen = 0;
+
 	va_start(ap, fmt);
-	ttcolor(CTEXT);
-	ttmove(nrow - 1, 0);
+	eml_capture = TRUE;
 	eformat(fmt, ap);
+	eml_capture = FALSE;
 	va_end(ap);
-	tteeol();
-	ttflush();
-	epresf = TRUE;
+
+	eredraw(NULL, 0, 0);
 }
 
 /*
@@ -965,12 +950,26 @@ eputs(const char *s)
 }
 
 /*
- * Put character.  Watch for control characters, and for the line getting
- * too long.
+ * Put character.  In capture mode, append to eml_prompt (expanding
+ * control characters as ^X) so the echo area can be repainted from a
+ * stable source later.  Otherwise write to the terminal, matching the
+ * historical truncation behavior at the end of the row.  The multi-row
+ * wrapping happens in eredraw(), not here.
  */
 static void
 eputc(char c)
 {
+	if (eml_capture) {
+		if (ISCTRL(c)) {
+			eputc('^');
+			c = CCHR(c);
+		}
+		if (eml_promptlen + 1 < EML_PROMPT_MAX) {
+			eml_prompt[eml_promptlen++] = c;
+			eml_prompt[eml_promptlen] = '\0';
+		}
+		return;
+	}
 	if (ttcol + 2 < ncol) {
 		if (ISCTRL(c)) {
 			eputc('^');
@@ -992,6 +991,177 @@ free_file_list(struct list *lp)
 		free(lp);
 		lp = next;
 	}
+}
+
+/*
+ * Try to change the echo area's physical row count to target_rows.
+ * On grow, shrink every window whose mode line currently sits just
+ * above the echo area; on shrink, grow them back by the same delta.
+ * Returns TRUE on success, FALSE if any bottom-touching window cannot
+ * shrink without dropping below one text row (caller caps the height
+ * and we silently truncate further input, matching the historical
+ * behavior for echo lines that overflowed).
+ */
+static int
+eml_resize(int target_rows)
+{
+	struct mgwin	*wp;
+	int		 delta, mode_row;
+
+	if (target_rows == eml_rows)
+		return (TRUE);
+	delta = target_rows - eml_rows;
+	mode_row = nrow - eml_rows - 1;
+
+	if (delta > 0) {
+		for (wp = wheadp; wp != NULL; wp = wp->w_wndp) {
+			if (wp->w_toprow + wp->w_ntrows == mode_row &&
+			    wp->w_ntrows - delta < 1)
+				return (FALSE);
+		}
+	}
+
+	for (wp = wheadp; wp != NULL; wp = wp->w_wndp) {
+		if (wp->w_toprow + wp->w_ntrows == mode_row) {
+			wp->w_ntrows -= delta;
+			wp->w_rflag |= WFFULL | WFMODE;
+		}
+	}
+	eml_rows = target_rows;
+	sgarbf = TRUE;
+	return (TRUE);
+}
+
+/*
+ * On exit from the echo area (eread done, eerase, etc.) grow the
+ * bottom-touching window(s) back to their original size.  The next
+ * update() in the main loop will reseat the mode line at nrow - 2
+ * and repaint the buffer text we had borrowed.
+ */
+static void
+eml_reset(void)
+{
+	if (eml_rows > 1)
+		(void)eml_resize(1);
+}
+
+static int
+eml_maxrows(void)
+{
+	int m = nrow / 2;
+	return (m < 1 ? 1 : m);
+}
+
+/*
+ * Repaint the echo area from eml_prompt + buf.  Wraps the rendered
+ * text across multiple rows when needed, growing the area upward from
+ * row nrow-1.  Tracks the visual cursor position from cpos (an offset
+ * into buf, with control characters expanded as ^X just like eputc
+ * does).  Capped at nrow/2 rows; anything beyond that is truncated,
+ * matching the historical drop-on-overflow behavior.
+ */
+static void
+eredraw(const char *buf, int epos, int cpos)
+{
+	int	max_rows, rows_needed, top, total, i;
+	int	cur_row, cur_col;
+	char	c;
+
+	if (ncol <= 0 || nrow <= 0)
+		return;
+
+	total = eml_promptlen;
+	if (buf != NULL) {
+		for (i = 0; i < epos; i++)
+			total += ISCTRL(buf[i]) ? 2 : 1;
+	}
+
+	max_rows = eml_maxrows();
+	rows_needed = 1 + total / ncol;
+	if (rows_needed > max_rows)
+		rows_needed = max_rows;
+	if (rows_needed < 1)
+		rows_needed = 1;
+
+	/*
+	 * Resize bottom-touching window(s) so the mode line floats above
+	 * the new echo area, then let update() repaint the new layout
+	 * before we draw the prompt + input on top.  If growing fails
+	 * (e.g. bottom window already at 1 row), cap and silently
+	 * truncate excess input.
+	 */
+	if (rows_needed != eml_rows) {
+		if (!eml_resize(rows_needed))
+			rows_needed = eml_rows;
+		update(CMODE);
+	}
+
+	ttcolor(CTEXT);
+
+	top = nrow - rows_needed;
+	ttmove(top, 0);
+
+	cur_row = -1;
+	cur_col = -1;
+
+	/* Prompt is already expanded; render verbatim. */
+	for (i = 0; i < eml_promptlen; i++) {
+		if (ttcol + 2 >= ncol) {
+			tteeol();
+			if (ttrow >= nrow - 1)
+				goto done_render;
+			ttmove(ttrow + 1, 0);
+		}
+		ttputc((unsigned char)eml_prompt[i]);
+		ttcol++;
+	}
+
+	if (buf != NULL) {
+		for (i = 0; i < epos; i++) {
+			if (i == cpos) {
+				cur_row = ttrow;
+				cur_col = ttcol;
+			}
+			c = buf[i];
+			if (ISCTRL(c)) {
+				if (ttcol + 2 >= ncol) {
+					tteeol();
+					if (ttrow >= nrow - 1)
+						goto done_render;
+					ttmove(ttrow + 1, 0);
+				}
+				ttputc('^');
+				ttcol++;
+				ttputc(CCHR(c));
+				ttcol++;
+			} else {
+				if (ttcol + 2 >= ncol) {
+					tteeol();
+					if (ttrow >= nrow - 1)
+						goto done_render;
+					ttmove(ttrow + 1, 0);
+				}
+				ttputc((unsigned char)c);
+				ttcol++;
+			}
+		}
+		if (cpos == epos) {
+			cur_row = ttrow;
+			cur_col = ttcol;
+		}
+	}
+
+done_render:
+	tteeol();
+
+	if (cur_row < 0) {
+		cur_row = ttrow;
+		cur_col = ttcol;
+	}
+
+	ttmove(cur_row, cur_col);
+	ttflush();
+	epresf = TRUE;
 }
 
 static struct list *
