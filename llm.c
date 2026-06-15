@@ -4,12 +4,14 @@
  * LLM coding-assistant command.
  *
  *	M-x llm
- *		Prompt user for an instruction.  Send the active region
- *		(or the whole buffer if no mark is set) plus the instruction
- *		to a local OpenAI-compatible chat-completions endpoint via
- *		curl(1).  Strip the response down to the contents of the
- *		first fenced code block and replace the region (or whole
- *		buffer) with it, wrapped in undo boundaries.
+ *		Pop up a *LLM Prompt* buffer and snapshot the source
+ *		buffer's region (or dot position if no mark is set).
+ *		The user composes a multi-line prompt in the compose
+ *		buffer (no length cap, normal editing).  C-c C-c sends
+ *		the prompt + saved context to a local OpenAI-compatible
+ *		chat-completions endpoint via curl(1) and replaces the
+ *		original region with the contents of the first fenced
+ *		code block from the response.  C-c C-k aborts.
  *
  *	M-x llm-set-url    "https://host:port/v1/chat/completions"
  *	M-x llm-set-model  "model-name"
@@ -36,7 +38,11 @@
 #include <unistd.h>
 
 #include "def.h"
+#include "kbd.h"
+#include "funmap.h"
 #include "macro.h"
+
+#define LLM_PROMPT_BUFNAME	"*LLM Prompt*"
 
 #define LLM_SYSTEM_PROMPT \
 	"You are a coding assistant embedded in a text editor. When asked " \
@@ -61,6 +67,25 @@ static char	*llm_url = NULL;
 static char	*llm_model = NULL;
 static char	*llm_key = NULL;
 
+/*
+ * State carried across the compose-buffer round trip.  Only one
+ * session is supported at a time; if the user invokes M-x llm while
+ * a compose buffer is already up, the prior session is overwritten.
+ * Source-buffer positions are stored as line numbers + offsets, not
+ * raw struct line *, so that edits made in the source buffer between
+ * compose-open and compose-send don't leave us holding freed pointers.
+ */
+static struct {
+	int		 active;
+	struct buffer	*src_bp;
+	struct buffer	*prompt_bp;
+	int		 has_region;
+	int		 dot_lineno;
+	int		 dot_offset;
+	int		 mark_lineno;
+	int		 mark_offset;
+} llm_session;
+
 static int	 llm_set_str(char **, const char *);
 static char	*json_escape(const char *);
 static char	*json_extract_content(const char *);
@@ -68,6 +93,10 @@ static char	*llm_strip_fences(char *);
 static int	 llm_pipe_curl(const char *, size_t, char **, size_t *);
 static int	 llm_query(const char *, const char *, size_t, int, char **);
 static int	 read_macro_arg(char *, size_t);
+static int	 llm_run(const char *);
+static char	*buffer_text(struct buffer *, size_t *);
+static struct line	*lineno_to_lp(struct buffer *, int);
+static int	 buffer_in_list(struct buffer *);
 
 /*
  * Pull a single argument out of the interpreter's argument list.
@@ -550,15 +579,85 @@ done:
 }
 
 /*
- * M-x llm  --  prompt for instruction, send region (or whole buffer if no
- * mark is set), replace in place with the stripped code from the response.
- * Whole operation is wrapped in undo boundaries so a single C-/ reverses it.
+ * Walk all lines of bp and concatenate them into a malloc'd buffer,
+ * separating lines with '\n'.  Empty buffer returns "" (allocated).
  */
-int
-llm(int f, int n)
+static char *
+buffer_text(struct buffer *bp, size_t *outlen)
+{
+	struct line	*lp;
+	char		*out;
+	size_t		 total = 0, off = 0;
+	int		 len;
+
+	for (lp = bfirstlp(bp); lp != bp->b_headp; lp = lforw(lp)) {
+		total += (size_t)llength(lp);
+		if (lforw(lp) != bp->b_headp)
+			total++;	/* implied newline */
+	}
+	if ((out = malloc(total + 1)) == NULL)
+		return (NULL);
+	for (lp = bfirstlp(bp); lp != bp->b_headp; lp = lforw(lp)) {
+		len = llength(lp);
+		if (len > 0)
+			memcpy(out + off, ltext(lp), (size_t)len);
+		off += (size_t)len;
+		if (lforw(lp) != bp->b_headp)
+			out[off++] = '\n';
+	}
+	out[off] = '\0';
+	if (outlen != NULL)
+		*outlen = off;
+	return (out);
+}
+
+/*
+ * Resolve a 1-based line number to a struct line * in bp.  Clamps to the
+ * last line if the buffer has shrunk since the lineno was captured.
+ */
+static struct line *
+lineno_to_lp(struct buffer *bp, int lineno)
+{
+	struct line	*lp = bfirstlp(bp);
+	int		 i = 1;
+
+	while (lp != bp->b_headp && i < lineno) {
+		struct line *nx = lforw(lp);
+		if (nx == bp->b_headp)
+			break;
+		lp = nx;
+		i++;
+	}
+	return (lp);
+}
+
+/*
+ * Returns TRUE if bp is still linked into the global buffer list.
+ * Guards against the user killing the source buffer between the
+ * compose-open call and the C-c C-c send.
+ */
+static int
+buffer_in_list(struct buffer *bp)
+{
+	struct buffer	*b;
+
+	if (bp == NULL)
+		return (FALSE);
+	for (b = bheadp; b != NULL; b = b->b_bufp)
+		if (b == bp)
+			return (TRUE);
+	return (FALSE);
+}
+
+/*
+ * Run the LLM query and replace the saved region.  Assumes curbp/curwp
+ * are pointed at the source buffer and the saved dot/mark are valid.
+ * Used by both the interactive (compose-send) and inmacro paths.
+ */
+static int
+llm_run(const char *user_instr)
 {
 	struct region	 region;
-	char		 ibuf[BUFSIZE], *iprompt;
 	char		*ctx = NULL, *resp = NULL, *code;
 	int		 has_region, ret = FALSE;
 	size_t		 ctxlen, codelen, i;
@@ -579,18 +678,6 @@ llm(int f, int n)
 		return (FALSE);
 	}
 
-	if (inmacro) {
-		if (read_macro_arg(ibuf, sizeof(ibuf)) != TRUE)
-			return (FALSE);
-		iprompt = ibuf;
-	} else {
-		if ((iprompt = eread("LLM prompt: ", ibuf, sizeof(ibuf),
-		    EFNEW | EFCR)) == NULL)
-			return (ABORT);
-		if (iprompt[0] == '\0')
-			return (FALSE);
-	}
-
 	has_region = (curwp->w_markp != NULL);
 
 	if (has_region) {
@@ -607,7 +694,6 @@ llm(int f, int n)
 			curwp->w_marko = off;
 			curwp->w_markline = (int)i;
 		}
-		/* Compute region size by walking from dot to mark. */
 		region.r_linep = curwp->w_dotp;
 		region.r_offset = curwp->w_doto;
 		region.r_lineno = curwp->w_dotline;
@@ -633,7 +719,6 @@ llm(int f, int n)
 		}
 		region.r_size = (RSIZE)total;
 	} else {
-		/* Whole buffer.  Position dot at bob; compute total size. */
 		region.r_linep = bfirstlp(curbp);
 		region.r_offset = 0;
 		region.r_lineno = 1;
@@ -661,13 +746,12 @@ llm(int f, int n)
 	ewprintf("Querying LLM...");
 	update(CMODE);
 
-	if (llm_query(iprompt, ctx, ctxlen, has_region, &resp) != TRUE)
+	if (llm_query(user_instr, ctx, ctxlen, has_region, &resp) != TRUE)
 		goto done;
 
 	code = llm_strip_fences(resp);
 	codelen = strlen(code);
 
-	/* Move dot to region start and replace. */
 	curwp->w_dotp = region.r_linep;
 	curwp->w_doto = region.r_offset;
 	curwp->w_dotline = region.r_lineno;
@@ -706,4 +790,270 @@ done:
 	free(ctx);
 	free(resp);
 	return (ret);
+}
+
+/*
+ * M-x llm  --  pop up the *LLM Prompt* compose buffer.  Snapshots the
+ * source buffer's region (if any) so the user can write a free-form,
+ * multi-line prompt in a real buffer without the echo-line length cap.
+ * C-c C-c (llm-compose-send) submits; C-c C-k (llm-compose-abort) cancels.
+ *
+ * When called from a macro / .mg interpreter, falls back to the legacy
+ * single-line eread-style prompt so existing scripts keep working.
+ */
+int
+llm(int f, int n)
+{
+	struct buffer	*src_bp, *prompt_bp;
+	struct maps_s	*mode;
+	char		 ibuf[BUFSIZE], *iprompt;
+
+	if (llm_url == NULL || llm_url[0] == '\0' ||
+	    llm_model == NULL || llm_model[0] == '\0') {
+		dobeep();
+		ewprintf("LLM: not configured; "
+		    "use llm-set-url and llm-set-model");
+		return (FALSE);
+	}
+
+	if (inmacro) {
+		if (read_macro_arg(ibuf, sizeof(ibuf)) != TRUE)
+			return (FALSE);
+		iprompt = ibuf;
+		if (iprompt[0] == '\0')
+			return (FALSE);
+		return (llm_run(iprompt));
+	}
+
+	if (curbp->b_flag & BFREADONLY) {
+		dobeep();
+		ewprintf("Buffer is read-only");
+		return (FALSE);
+	}
+
+	src_bp = curbp;
+
+	if ((prompt_bp = bfind(LLM_PROMPT_BUFNAME, TRUE)) == NULL) {
+		dobeep();
+		ewprintf("LLM: cannot create %s", LLM_PROMPT_BUFNAME);
+		return (FALSE);
+	}
+	if (bclear(prompt_bp) != TRUE)
+		return (FALSE);
+
+	if ((mode = name_mode("llm-compose")) == NULL) {
+		dobeep();
+		ewprintf("LLM: llm-compose mode not registered");
+		return (FALSE);
+	}
+	prompt_bp->b_modes[0] = name_mode("fundamental");
+	prompt_bp->b_modes[1] = mode;
+	prompt_bp->b_nmodes = 1;
+
+	llm_session.active = TRUE;
+	llm_session.src_bp = src_bp;
+	llm_session.prompt_bp = prompt_bp;
+	llm_session.has_region = (curwp->w_markp != NULL);
+	llm_session.dot_lineno = curwp->w_dotline;
+	llm_session.dot_offset = curwp->w_doto;
+	llm_session.mark_lineno = curwp->w_markline;
+	llm_session.mark_offset = curwp->w_marko;
+
+	if (showbuffer(prompt_bp, curwp, WFFULL | WFFRAME | WFMODE) != TRUE) {
+		llm_session.active = FALSE;
+		return (FALSE);
+	}
+	curbp = prompt_bp;
+	curwp->w_dotp = bfirstlp(prompt_bp);
+	curwp->w_doto = 0;
+	curwp->w_dotline = 1;
+	curwp->w_markp = NULL;
+	curwp->w_marko = 0;
+	curwp->w_markline = 1;
+	curwp->w_linep = curwp->w_dotp;
+
+	ewprintf("LLM: type prompt; C-c C-c to send, C-c C-k to abort");
+	return (TRUE);
+}
+
+/*
+ * C-c C-c in *LLM Prompt*.  Read the prompt text from the compose
+ * buffer, restore the source buffer + saved dot/mark, kill the
+ * compose buffer, then run the query/replace.
+ */
+int
+llm_compose_send(int f, int n)
+{
+	struct buffer	*src_bp, *prompt_bp;
+	char		*prompt = NULL;
+	size_t		 plen = 0;
+	struct line	*dot_lp, *mark_lp;
+	int		 ret;
+
+	if (!llm_session.active || curbp != llm_session.prompt_bp) {
+		dobeep();
+		ewprintf("LLM: not in compose buffer");
+		return (FALSE);
+	}
+
+	src_bp = llm_session.src_bp;
+	prompt_bp = llm_session.prompt_bp;
+
+	if (!buffer_in_list(src_bp)) {
+		dobeep();
+		ewprintf("LLM: source buffer is gone");
+		llm_session.active = FALSE;
+		return (FALSE);
+	}
+
+	if ((prompt = buffer_text(prompt_bp, &plen)) == NULL) {
+		dobeep();
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	if (plen == 0) {
+		free(prompt);
+		dobeep();
+		ewprintf("LLM: prompt is empty");
+		return (FALSE);
+	}
+
+	if (showbuffer(src_bp, curwp, WFFULL | WFFRAME | WFMODE) != TRUE) {
+		free(prompt);
+		dobeep();
+		ewprintf("LLM: cannot switch to source buffer");
+		return (FALSE);
+	}
+	curbp = src_bp;
+
+	dot_lp = lineno_to_lp(src_bp, llm_session.dot_lineno);
+	curwp->w_dotp = dot_lp;
+	curwp->w_doto = llm_session.dot_offset;
+	if (curwp->w_doto > llength(dot_lp))
+		curwp->w_doto = llength(dot_lp);
+	curwp->w_dotline = llm_session.dot_lineno;
+
+	if (llm_session.has_region) {
+		mark_lp = lineno_to_lp(src_bp, llm_session.mark_lineno);
+		curwp->w_markp = mark_lp;
+		curwp->w_marko = llm_session.mark_offset;
+		if (curwp->w_marko > llength(mark_lp))
+			curwp->w_marko = llength(mark_lp);
+		curwp->w_markline = llm_session.mark_lineno;
+	} else {
+		curwp->w_markp = NULL;
+		curwp->w_marko = 0;
+		curwp->w_markline = 1;
+	}
+	curwp->w_linep = dot_lp;
+
+	llm_session.active = FALSE;
+	llm_session.src_bp = NULL;
+	llm_session.prompt_bp = NULL;
+
+	(void)killbuffer(prompt_bp);
+
+	ret = llm_run(prompt);
+	free(prompt);
+	return (ret);
+}
+
+/*
+ * C-c C-k in *LLM Prompt*.  Discard the in-progress prompt, return
+ * to the source buffer, and kill the compose buffer.
+ */
+int
+llm_compose_abort(int f, int n)
+{
+	struct buffer	*src_bp, *prompt_bp;
+	struct line	*dot_lp, *mark_lp;
+
+	if (!llm_session.active || curbp != llm_session.prompt_bp) {
+		dobeep();
+		ewprintf("LLM: not in compose buffer");
+		return (FALSE);
+	}
+
+	src_bp = llm_session.src_bp;
+	prompt_bp = llm_session.prompt_bp;
+
+	if (buffer_in_list(src_bp)) {
+		if (showbuffer(src_bp, curwp, WFFULL | WFFRAME | WFMODE)
+		    == TRUE) {
+			curbp = src_bp;
+			dot_lp = lineno_to_lp(src_bp,
+			    llm_session.dot_lineno);
+			curwp->w_dotp = dot_lp;
+			curwp->w_doto = llm_session.dot_offset;
+			if (curwp->w_doto > llength(dot_lp))
+				curwp->w_doto = llength(dot_lp);
+			curwp->w_dotline = llm_session.dot_lineno;
+			if (llm_session.has_region) {
+				mark_lp = lineno_to_lp(src_bp,
+				    llm_session.mark_lineno);
+				curwp->w_markp = mark_lp;
+				curwp->w_marko = llm_session.mark_offset;
+				if (curwp->w_marko > llength(mark_lp))
+					curwp->w_marko = llength(mark_lp);
+				curwp->w_markline = llm_session.mark_lineno;
+			}
+			curwp->w_linep = dot_lp;
+		}
+	}
+
+	llm_session.active = FALSE;
+	llm_session.src_bp = NULL;
+	llm_session.prompt_bp = NULL;
+
+	(void)killbuffer(prompt_bp);
+
+	ewprintf("LLM: aborted");
+	return (TRUE);
+}
+
+/*
+ * Keymap for the *LLM Prompt* compose buffer.  Overrides only the
+ * C-c prefix; everything else falls through (via rescan defaults)
+ * to fundamental-mode, so normal editing keys work as expected.
+ *
+ *	C-c C-c	llm-compose-send
+ *	C-c C-k	llm-compose-abort
+ */
+static PF llmcompose_cc[] = {
+	llm_compose_send,	/* ^C */
+	rescan,			/* ^D */
+	rescan,			/* ^E */
+	rescan,			/* ^F */
+	rescan,			/* ^G */
+	rescan,			/* ^H */
+	rescan,			/* ^I */
+	rescan,			/* ^J */
+	llm_compose_abort,	/* ^K */
+};
+
+static struct KEYMAPE (1) llmcompose_ccmap = {
+	1, 1, rescan,
+	{
+		{ CCHR('C'), CCHR('K'), llmcompose_cc, NULL }
+	}
+};
+
+static PF llmcompose_top[] = {
+	NULL,			/* ^C is a prefix for llmcompose_ccmap */
+};
+
+static struct KEYMAPE (1) llmcomposemap = {
+	1, 1, rescan,
+	{
+		{ CCHR('C'), CCHR('C'), llmcompose_top,
+		    (KEYMAP *)&llmcompose_ccmap }
+	}
+};
+
+void
+llm_init(void)
+{
+	funmap_add(llm_compose_send, "llm-compose-send", 0);
+	funmap_add(llm_compose_abort, "llm-compose-abort", 0);
+	maps_add((KEYMAP *)&llmcomposemap, "llm-compose");
 }

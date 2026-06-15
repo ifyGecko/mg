@@ -780,6 +780,8 @@ int		 llm(int, int);
 int		 llm_set_url(int, int);
 int		 llm_set_model(int, int);
 int		 llm_set_key(int, int);
+int		 llm_compose_send(int, int);
+int		 llm_compose_abort(int, int);
 
 /*
  * Externals.
