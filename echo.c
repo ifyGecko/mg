@@ -209,6 +209,48 @@ eread(const char *fmt, char *buf, size_t nbuf, int flag, ...)
 	return (rep);
 }
 
+/*
+ * Ctrl+Left and Ctrl+Right escape sequences as emitted by common
+ * terminals.  The leading ESC is consumed by the dispatcher in veread()
+ * before these are matched, so each entry starts with the byte that
+ * follows ESC.
+ */
+#define NCARROW 3
+static const char * const cleft_pat[NCARROW]  = {
+	"[1;5D",	/* xterm / gnome-terminal / tmux / linux console */
+	"Od",		/* rxvt */
+	"[5D",		/* older xterm/screen */
+};
+static const char * const cright_pat[NCARROW] = {
+	"[1;5C",
+	"Oc",
+	"[5C",
+};
+
+/*
+ * Move cpos backward/forward by one word inside the minibuffer buffer,
+ * using the same ISWORD() semantics as the main editor's word commands.
+ */
+static int
+ebackword(const char *buf, int cpos)
+{
+	while (cpos > 0 && !ISWORD(buf[cpos - 1]))
+		cpos--;
+	while (cpos > 0 && ISWORD(buf[cpos - 1]))
+		cpos--;
+	return (cpos);
+}
+
+static int
+eforwword(const char *buf, int epos, int cpos)
+{
+	while (cpos < epos && !ISWORD(buf[cpos]))
+		cpos++;
+	while (cpos < epos && ISWORD(buf[cpos]))
+		cpos++;
+	return (cpos);
+}
+
 static char *
 veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 {
@@ -218,6 +260,7 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 	int	 cplflag;		/* display completion list */
 	int	 cwin = FALSE;		/* completion list created */
 	int	 mr, ml;		/* match left/right arrows */
+	int	 mcl[3], mcr[3];	/* match Ctrl-left/right arrows */
 	int	 esc;			/* position in esc pattern */
 	struct buffer	*bp;			/* completion list buffer */
 	struct mgwin	*wp;			/* window for compl list */
@@ -297,6 +340,8 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 		cplflag = FALSE;
 
 		if (esc > 0) { /* ESC sequence started */
+			int done = 0;
+
 			match = 0;
 			if (ml == esc && key_left[ml] && c == key_left[ml]) {
 				match++;
@@ -312,6 +357,37 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 					esc = 0;
 				}
 			}
+			for (i = 0; i < NCARROW; i++) {
+				const char *p;
+
+				p = cleft_pat[i];
+				if (mcl[i] == esc && p[mcl[i] - 1] != '\0' &&
+				    c == p[mcl[i] - 1]) {
+					match++;
+					mcl[i]++;
+					if (p[mcl[i] - 1] == '\0') {
+						cpos = ebackword(buf, cpos);
+						eredraw(buf, epos, cpos);
+						esc = 0;
+						done = 1;
+					}
+				}
+				p = cright_pat[i];
+				if (mcr[i] == esc && p[mcr[i] - 1] != '\0' &&
+				    c == p[mcr[i] - 1]) {
+					match++;
+					mcr[i]++;
+					if (p[mcr[i] - 1] == '\0') {
+						cpos = eforwword(buf, epos,
+						    cpos);
+						eredraw(buf, epos, cpos);
+						esc = 0;
+						done = 1;
+					}
+				}
+			}
+			if (done)
+				continue;
 			if (match == 0) {
 				esc = 0;
 				continue;
@@ -385,6 +461,8 @@ veread(const char *fp, char *buf, size_t nbuf, int flag, va_list ap)
 			break;
 		case CCHR('['):
 			ml = mr = esc = 1;
+			for (i = 0; i < NCARROW; i++)
+				mcl[i] = mcr[i] = 1;
 			break;
 		case CCHR('J'):
 			c = CCHR('M');

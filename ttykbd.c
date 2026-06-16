@@ -58,6 +58,31 @@ ttykeymapinit(void)
 	if (key_dc)
 		dobindkey(fundamental_map, "delete-char", key_dc);
 
+	/*
+	 * Emacs-style Ctrl+Left / Ctrl+Right word movement.  Terminfo has
+	 * no standard capability for these; some entries publish them as
+	 * extended caps kLFT5 / kRIT5, so honor those when present, and
+	 * also bind the well-known xterm and rxvt-style sequences so the
+	 * keys work on essentially every modern terminal.
+	 */
+	{
+		char *p;
+
+		p = tigetstr("kLFT5");
+		if (p != NULL && p != (char *)-1)
+			dobindkey(fundamental_map, "backward-word", p);
+		dobindkey(fundamental_map, "backward-word", "\033[1;5D");
+		dobindkey(fundamental_map, "backward-word", "\033Od");
+		dobindkey(fundamental_map, "backward-word", "\033[5D");
+
+		p = tigetstr("kRIT5");
+		if (p != NULL && p != (char *)-1)
+			dobindkey(fundamental_map, "forward-word", p);
+		dobindkey(fundamental_map, "forward-word", "\033[1;5C");
+		dobindkey(fundamental_map, "forward-word", "\033Oc");
+		dobindkey(fundamental_map, "forward-word", "\033[5C");
+	}
+
 	if ((cp = getenv("TERM")) != NULL &&
 	    (ffp = startupfile(cp, NULL, file, sizeof(file))) != NULL) {
 		if (load(ffp, file) != TRUE)
