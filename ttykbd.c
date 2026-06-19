@@ -83,6 +83,29 @@ ttykeymapinit(void)
 		dobindkey(fundamental_map, "forward-word", "\033[5C");
 	}
 
+	/*
+	 * Emacs-style C-x <left> / C-x <right> buffer cycling.  Bind the
+	 * terminfo-reported arrow sequence (when present) and the common
+	 * xterm/rxvt fallbacks, each prefixed by C-x.
+	 */
+	{
+		char buf[32];
+
+		if (key_right != NULL) {
+			snprintf(buf, sizeof(buf), "\030%s", key_right);
+			dobindkey(fundamental_map, "next-buffer", buf);
+		}
+		dobindkey(fundamental_map, "next-buffer", "^X\\e[C");
+		dobindkey(fundamental_map, "next-buffer", "^X\\eOC");
+
+		if (key_left != NULL) {
+			snprintf(buf, sizeof(buf), "\030%s", key_left);
+			dobindkey(fundamental_map, "previous-buffer", buf);
+		}
+		dobindkey(fundamental_map, "previous-buffer", "^X\\e[D");
+		dobindkey(fundamental_map, "previous-buffer", "^X\\eOD");
+	}
+
 	if ((cp = getenv("TERM")) != NULL &&
 	    (ffp = startupfile(cp, NULL, file, sizeof(file))) != NULL) {
 		if (load(ffp, file) != TRUE)

@@ -128,6 +128,66 @@ usebufname(const char *bufp)
 }
 
 /*
+ * Cycle to the next buffer in bheadp order. Wraps around when the end
+ * of the list is reached. With a negative argument, cycles backward.
+ * Bound to "C-x <right>".
+ */
+int
+next_buffer(int f, int n)
+{
+	struct buffer	*bp;
+	int		 cnt;
+
+	if (n < 0)
+		return (prev_buffer(f, -n));
+	if (n == 0)
+		return (TRUE);
+	if (bheadp == NULL || bheadp->b_bufp == NULL)
+		return (TRUE);
+
+	bp = curbp;
+	for (cnt = 0; cnt < n; cnt++)
+		bp = (bp->b_bufp != NULL) ? bp->b_bufp : bheadp;
+
+	return (usebufname(bp->b_bname));
+}
+
+/*
+ * Cycle to the previous buffer in bheadp order. Wraps around when the
+ * beginning of the list is reached. With a negative argument, cycles
+ * forward. Bound to "C-x <left>".
+ */
+int
+prev_buffer(int f, int n)
+{
+	struct buffer	*bp, *p;
+	int		 cnt;
+
+	if (n < 0)
+		return (next_buffer(f, -n));
+	if (n == 0)
+		return (TRUE);
+	if (bheadp == NULL || bheadp->b_bufp == NULL)
+		return (TRUE);
+
+	bp = curbp;
+	for (cnt = 0; cnt < n; cnt++) {
+		for (p = bheadp; p != NULL; p = p->b_bufp)
+			if (p->b_bufp == bp)
+				break;
+		if (p == NULL) {
+			/* bp is the head; wrap to the tail */
+			p = bheadp;
+			while (p->b_bufp != NULL)
+				p = p->b_bufp;
+		}
+		bp = p;
+	}
+
+	return (usebufname(bp->b_bname));
+}
+
+/*
  * Attach a buffer to a window. The values of dot and mark come
  * from the buffer if the use count is 0. Otherwise, they come
  * from some other window.  *scratch* is the default alternate

@@ -479,6 +479,8 @@ int		 augbname(char *, const char *, size_t);
 struct mgwin    *popbuf(struct buffer *, int);
 int		 bufferinsert(int, int);
 int		 usebuffer(int, int);
+int		 next_buffer(int, int);
+int		 prev_buffer(int, int);
 int		 notmodified(int, int);
 int		 popbuftop(struct buffer *, int);
 int		 getbufcwd(char *, size_t);
