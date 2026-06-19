@@ -60,7 +60,6 @@ static void	 pty_init(void);
 static __dead void usage(void);
 
 extern char	*__progname;
-extern void     closetags(void);
 
 static __dead void
 usage(void)
@@ -362,7 +361,6 @@ quit(int f, int n)
 	if (s == FALSE
 	    || eyesno("Modified buffers exist; really exit") == TRUE) {
 		vttidy();
-		closetags();
 		exit(0);
 	}
 	return (TRUE);
