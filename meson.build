@@ -49,9 +49,9 @@ add_global_arguments('-Wno-deprecated-declarations', language : 'c')
 
 executable(
   'mg', 'cinfo.c', 'echo.c', 'line.c', 'ttyio.c', 'log.c',
-  'autoexec.c', 'bell.c', 'cscope.c', 'dir.c', 'dired.c', 'file.c',
+  'autoexec.c', 'bell.c', 'dir.c', 'dired.c', 'file.c',
   'fileio.c', 'grep.c', 'help.c', 'kbd.c', 'macro.c', 're_search.c',
-  'region.c', 'search.c', 'spawn.c', 'tags.c', 'tty.c', 'ttykbd.c',
+  'region.c', 'search.c', 'spawn.c', 'tty.c', 'ttykbd.c',
   'undo.c', 'version.c', 'window.c', 'word.c', 'yank.c', 'main.c',
   'basic.c', 'buffer.c', 'cmode.c', 'display.c', 'extend.c', 'hexmode.c', 'makemode.c',
   'funmap.c', 'interpreter.c', 'keymap.c', 'llm.c', 'match.c', 'modes.c',

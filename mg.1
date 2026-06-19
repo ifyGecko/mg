@@ -117,20 +117,6 @@ Further, if any application creates backup files in
 these can be left with the
 .Ic leave-tmpdir-backups
 command.
-.Sh TAGS
-.Nm
-supports tag files created by
-.Xr ctags 1 ,
-allowing the user to quickly locate various object definitions.
-Note though that emacs uses etags, not ctags.
-.Sh CSCOPE
-.Nm
-supports navigating source code using cscope.
-However,
-.Nm
-requires cscope and cscope-indexer executables to be present in
-.Ev PATH
-for it to work.
 .Sh DEFAULT KEY BINDINGS
 Normal editing commands are very similar to GNU Emacs.
 In the following examples, C-x means Control-x, and M-x means Meta-x,
@@ -144,24 +130,6 @@ set-mark-command
 beginning-of-line
 .It C-b
 backward-char
-.It C-c s c
-cscope-find-functions-calling-this-function
-.It C-c s d
-cscope-find-global-definition
-.It C-c s e
-cscope-find-egrep-pattern
-.It C-c s f
-cscope-find-this-file
-.It C-c s i
-cscope-find-files-including-file
-.It C-c s n
-cscope-next-symbol
-.It C-c s p
-cscope-prev-symbol
-.It C-c s s
-cscope-find-this-symbol
-.It C-c s t
-cscope-find-this-text-string
 .It C-d
 delete-char
 .It C-e
@@ -300,10 +268,6 @@ scroll-other-window
 just-one-space
 .It M-!
 shell-command
-.It M-.
-find-tag
-.It M-*
-pop-tag-mark
 .It M-%
 query-replace
 .It M-<
@@ -497,32 +461,6 @@ followed by a
 Count the number of lines matching the supplied regular expression.
 .It Ic count-non-matches
 Count the number of lines not matching the supplied regular expression.
-.It Ic cscope-find-this-symbol
-List the matches for the given symbol.
-.It Ic cscope-find-global-definition
-List global definitions for the given literal.
-.It Ic cscope-find-called-functions
-List functions called from the given function.
-.It Ic cscope-find-functions-calling-this-function
-List functions calling the given function.
-.It Ic cscope-find-this-text-string
-List locations matching the given text string.
-.It Ic cscope-find-egrep-pattern
-List locations matching the given extended regular expression pattern.
-.It Ic cscope-find-this-file
-List filenames matching the given filename.
-.It Ic cscope-find-files-including-file
-List files that #include the given filename.
-.It Ic cscope-next-symbol
-Navigate to the next match.
-.It Ic cscope-prev-symbol
-Navigate to the previous match.
-.It Ic cscope-next-file
-Navigate to the next file.
-.It Ic cscope-prev-file
-Navigate to the previous file.
-.It Ic cscope-create-list-of-files-to-index
-Create cscope's List and Index in the given directory.
 .It Ic define-key
 Prompts the user for a named keymap (mode),
 a key, and an
@@ -649,8 +587,6 @@ If the kill fails, or is aborted, revert to the original file.
 .It Ic find-file-other-window
 Opens the specified file in a second buffer.
 Splits the current window if necessary.
-.It Ic find-tag
-Jump to definition of tag at dot.
 .It Ic forward-char
 Move cursor forwards (or backwards, if
 .Va n
@@ -906,8 +842,6 @@ This command makes the previous (up the screen) window the
 current window.
 There are no errors, although the command does not do
 a lot if there is only 1 window.
-.It Ic pop-tag-mark
-Return to position where find-tag was previously invoked.
 .It Ic push-shell
 Suspend
 .Nm
@@ -1171,9 +1105,6 @@ As it moves, convert any characters to upper case.
 .It Ic visible-bell
 Toggle the visible bell.
 If this toggle is on, the modeline will flash.
-.It Ic visit-tags-table
-Load tags file to be used for subsequent
-.Ic find-tag .
 .It Ic what-cursor-position
 Display a bunch of useful information about the current location of
 dot.
@@ -1348,7 +1279,6 @@ alternative backup file location
 concise tutorial
 .El
 .Sh SEE ALSO
-.Xr ctags 1 ,
 .Xr curl 1 ,
 .Xr vi 1
 .Sh CAVEATS

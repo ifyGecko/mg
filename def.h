@@ -479,6 +479,8 @@ int		 augbname(char *, const char *, size_t);
 struct mgwin    *popbuf(struct buffer *, int);
 int		 bufferinsert(int, int);
 int		 usebuffer(int, int);
+int		 next_buffer(int, int);
+int		 prev_buffer(int, int);
 int		 notmodified(int, int);
 int		 popbuftop(struct buffer *, int);
 int		 getbufcwd(char *, size_t);
@@ -592,27 +594,6 @@ int		 backdel(int, int);
 int		 space_to_tabstop(int, int);
 int		 backtoindent(int, int);
 int		 joinline(int, int);
-
-/* tags.c X */
-int		 findtag(int, int);
-int 		 poptag(int, int);
-int		 tagsvisit(int, int);
-int		 curtoken(int, int, char *);
-
-/* cscope.c */
-int		 cssymbol(int, int);
-int		 csdefinition(int, int);
-int		 csfuncalled(int, int);
-int		 cscallerfuncs(int, int);
-int		 csfindtext(int, int);
-int		 csegrep(int, int);
-int		 csfindfile(int, int);
-int		 csfindinc(int, int);
-int		 csnextfile(int, int);
-int		 csnextmatch(int, int);
-int		 csprevfile(int, int);
-int		 csprevmatch(int, int);
-int		 cscreatelist(int, int);
 
 /* extend.c X */
 int		 insert(int, int);
@@ -811,7 +792,7 @@ extern int		 dovisiblebell;
 extern int		 dblspace;
 extern int		 allbro;
 extern int		 batch;
-extern char	 	 cinfo[];
+extern const char	 cinfo[];
 extern char		*keystrings[];
 extern char		 pat[NPAT];
 extern char		 prompt[];

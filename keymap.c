@@ -45,56 +45,6 @@ struct KEYMAPE (2) helpmap = {
 	}
 };
 
-static PF cCsc[] = {
-	cscallerfuncs,		/* c */
-	csdefinition,		/* d */
-	csegrep,		/* e */
-	csfindfile,		/* f */
-	rescan,			/* g */
-	rescan,			/* h */
-	csfindinc,		/* i */
-	rescan,			/* j */
-	rescan,			/* k */
-	rescan,			/* l */
-	rescan,			/* m */
-	csnextmatch,		/* n */
-	rescan,			/* o */
-	csprevmatch,		/* p */
-	rescan,			/* q */
-	rescan, 		/* r */
-	cssymbol,		/* s */
-	csfindtext		/* t */
-};
-
-static struct KEYMAPE (1) cCsmap = {
-	1,
-	1,
-	rescan,
-	{
-		{
-			'c', 't', cCsc, NULL
-		}
-	}
-};
-
-static PF cCs[] = {
-	NULL			/* s */
-};
-
-struct KEYMAPE (2) ccmap = {
-	2,
-	2,
-	rescan,
-	{
-		{
-			CCHR('@'), CCHR('@'), (PF[]){ rescan }, NULL
-		},
-		{
-			's', 's', cCs, (KEYMAP *) & cCsmap
-		}
-	}
-};
-
 static PF cX4cF[] = {
 	poptofile,		/* ^f */
 	ctrlg			/* ^g */
@@ -244,11 +194,11 @@ static PF metapct[] = {
 };
 
 static PF metami[] = {
-	poptag,                 /* * */
+	rescan,			/* * */
 	rescan,                 /* + */
 	rescan,                 /* , */
 	negative_argument,	/* - */
-	findtag,		/* . */
+	rescan,			/* . */
 	rescan,			/* / */
 	digit_argument,		/* 0 */
 	digit_argument,		/* 1 */
@@ -361,7 +311,7 @@ static PF fund_at[] = {
 	setmark,		/* ^@ */
 	gotobol,		/* ^A */
 	backchar,		/* ^B */
-	NULL,			/* ^C */
+	rescan,			/* ^C */
 	forwdel,		/* ^D */
 	gotoeol,		/* ^E */
 	forwchar,		/* ^F */
@@ -416,7 +366,7 @@ static struct KEYMAPE (8) fundmap = {
 	selfinsert,
 	{
 		{
-			CCHR('@'), CCHR('G'), fund_at, (KEYMAP *) & ccmap
+			CCHR('@'), CCHR('G'), fund_at, NULL
 		},
 		{
 			CCHR('H'), CCHR('H'), fund_h, (KEYMAP *) & helpmap

@@ -22,7 +22,7 @@ OBJS=  autoexec.o basic.o bell.o buffer.o cinfo.o dir.o display.o \
        kbd.o keymap.o line.o llm.o macro.o main.o match.o modes.o paragraph.o \
        re_search.o region.o search.o spawn.o tty.o ttyio.o ttykbd.o \
        undo.o util.o version.o window.o word.o yank.o
-OBJS+= cmode.o cscope.o dired.o grep.o hexmode.o makemode.o tags.o
+OBJS+= cmode.o dired.o grep.o hexmode.o makemode.o
 
 # PC_PATH is prepended to PKG_CONFIG_PATH (used for both libbsd and ncurses
 # lookups). SRC_FLAG selects the libc feature-test macro. Both are overridden
