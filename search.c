@@ -202,13 +202,18 @@ isearch(int dir)
 		switch (c = getkey(FALSE)) {
 		case CCHR('['):
 			/*
-			 * If new characters come in the next 300 msec,
-			 * we can assume that they belong to a longer
-			 * escaped sequence so we should ungetkey the
-			 * ESC to avoid writing out garbage.
+			 * If new characters arrive within 300 msec, this
+			 * ESC is the lead byte of a longer escape sequence
+			 * (e.g. an arrow key). Push it back so the main
+			 * command loop can read the full sequence, and exit
+			 * isearch without setting the mark -- the user is
+			 * moving point, not marking a region.
 			 */
-			if (ttwait(300) == FALSE)
+			if (ttwait(300) == FALSE) {
 				ungetkey(c);
+				srch_lastdir = dir;
+				return (TRUE);
+			}
 			/* FALLTHRU */
 		case CCHR('M'):
 			srch_lastdir = dir;
