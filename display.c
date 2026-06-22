@@ -499,6 +499,29 @@ paint_region(struct mgwin *wp)
 
 	lp = wp->w_linep;
 	in_region = 0;
+
+	/*
+	 * If the region's start line is above the viewport (scrolled off
+	 * the top), we're already inside the region before iteration
+	 * begins -- the forward walk over visible rows alone will never
+	 * see `sl` in that case and would leave everything unhighlighted.
+	 *
+	 * TODO: replace this O(lines-above-viewport) walk-back with an
+	 * O(1) line-number compare once `struct mgwin` carries a cached
+	 * line number for `w_linep` (e.g. `w_lineline`, maintained
+	 * wherever `w_linep` is assigned). Then this whole block becomes
+	 *     if (sln < w_lineline) in_region = 1;
+	 */
+	{
+		struct line *lb = lback(wp->w_linep);
+		while (lb != wp->w_bufp->b_headp) {
+			if (lb == sl) {
+				in_region = 1;
+				break;
+			}
+			lb = lback(lb);
+		}
+	}
 	for (i = 0; i < wp->w_ntrows; i++) {
 		srow = wp->w_toprow + i;
 		if (lp == wp->w_bufp->b_headp)
