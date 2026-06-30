@@ -365,12 +365,21 @@ isearch(int dir)
 			goto addchar;
 		default:
 			if (ISCTRL(c)) {
+				/*
+				 * Unhandled control character (e.g. C-b,
+				 * C-f, C-n, C-p): the user is exiting
+				 * isearch to move point or run a command,
+				 * not to mark a region. Push it back for
+				 * the main command loop and exit without
+				 * setting the mark -- otherwise the
+				 * subsequent motion would highlight the
+				 * region from the isearch start position
+				 * (often the previous match) to the new
+				 * point. Mirrors the ESC arrow-key
+				 * handling above.
+				 */
 				ungetkey(c);
-				curwp->w_markp = clp;
-				curwp->w_marko = cbo;
-				curwp->w_markline = cdotline;
-				ewprintf("Mark set");
-				curwp->w_rflag |= WFMOVE;
+				srch_lastdir = dir;
 				return (TRUE);
 			}
 			/* FALLTHRU */
