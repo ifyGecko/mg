@@ -283,6 +283,9 @@ killbuffer(struct buffer *bp)
 	int s;
 	struct undo_rec *rec;
 
+	shell_buffer_killed(bp);
+	term_buffer_killed(bp);
+
 	/*
 	 * Find some other buffer to display. Try the alternate buffer,
 	 * then the first different buffer in the buffer list.  If there's

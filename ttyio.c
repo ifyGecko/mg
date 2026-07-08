@@ -171,6 +171,8 @@ ttgetc(void)
 	ssize_t	ret;
 
 	do {
+		shell_wait_for_input();
+		term_wait_for_input();
 		ret = read(STDIN_FILENO, &c, 1);
 		if (ret == -1 && errno == EINTR) {
 			if (winch_flag) {

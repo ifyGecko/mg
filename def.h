@@ -764,6 +764,28 @@ int		 llm_set_key(int, int);
 int		 llm_compose_send(int, int);
 int		 llm_compose_abort(int, int);
 
+/* shell.c */
+void		 shell_init(void);
+int		 shell(int, int);
+int		 shell_send_input(int, int);
+int		 shell_interrupt(int, int);
+int		 shell_send_eof(int, int);
+void		 shell_wait_for_input(void);
+void		 shell_buffer_killed(struct buffer *);
+void		 shell_kill_all(void);
+void		 shell_notify_resize(void);
+
+/* term.c */
+void		 term_init(void);
+int		 term(int, int);
+int		 term_send_char(int, int);
+int		 term_interrupt(int, int);
+int		 term_kill_process(int, int);
+void		 term_wait_for_input(void);
+void		 term_buffer_killed(struct buffer *);
+void		 term_kill_all(void);
+void		 term_notify_resize(void);
+
 /*
  * Externals.
  */

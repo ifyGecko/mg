@@ -166,6 +166,8 @@ main(int argc, char **argv)
 		makemode_init();
 		hexmode_init();
 		llm_init();
+		shell_init();
+		term_init();
 
 		add_autoexec("Makefile",        "makefile-mode");
 		add_autoexec("*/Makefile",      "makefile-mode");
@@ -280,6 +282,8 @@ notnum:
 			winch_flag = 0;
 		}
 		update(CMODE);
+		shell_notify_resize();
+		term_notify_resize();
 		lastflag = thisflag;
 		thisflag = 0;
 
@@ -360,6 +364,8 @@ quit(int f, int n)
 		return (FALSE);
 	if (s == FALSE
 	    || eyesno("Modified buffers exist; really exit") == TRUE) {
+		shell_kill_all();
+		term_kill_all();
 		vttidy();
 		exit(0);
 	}
