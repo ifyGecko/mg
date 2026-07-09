@@ -65,7 +65,6 @@ struct shellproc {
 };
 
 static struct shellproc *shells;
-static volatile sig_atomic_t shell_chld_flag;
 static int shell_initialized;
 
 void	shell_init(void);
@@ -78,11 +77,9 @@ void	shell_buffer_killed(struct buffer *);
 void	shell_kill_all(void);
 void	shell_notify_resize(void);
 
-static void shell_sigchld(int);
 static void shell_reap(void);
 static void shell_remove(struct shellproc *);
 static struct shellproc *shell_find_by_bp(struct buffer *);
-static struct shellproc *shell_find_by_pid(pid_t);
 static int  shell_read(struct shellproc *);
 static void shell_process_byte(struct shellproc *, unsigned char);
 static void shell_emit_char(struct shellproc *, int);
@@ -139,8 +136,6 @@ static struct KEYMAPE (1) shellmap = {
 void
 shell_init(void)
 {
-	struct sigaction sa;
-
 	if (shell_initialized)
 		return;
 	shell_initialized = 1;
@@ -150,19 +145,15 @@ shell_init(void)
 	funmap_add(shell_interrupt, "shell-interrupt", 0);
 	funmap_add(shell_send_eof, "shell-send-eof", 0);
 	maps_add((KEYMAP *)&shellmap, "shell");
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = shell_sigchld;
-	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-	sigemptyset(&sa.sa_mask);
-	(void)sigaction(SIGCHLD, &sa, NULL);
-}
-
-static void
-shell_sigchld(int signo)
-{
-	(void)signo;
-	shell_chld_flag = 1;
+	/*
+	 * No SIGCHLD handler: default SIG_DFL leaves dead children as
+	 * zombies until we waitpid() them. shell_reap() and term_reap()
+	 * each poll their own known pids on every wait_for_input entry.
+	 * This side-steps the earlier bug where shell.c and term.c both
+	 * called sigaction(SIGCHLD, ...) -- whichever loaded last won,
+	 * the other module's chld_flag stayed at zero, its children were
+	 * never reaped, and its buffer's sp was orphaned in the list.
+	 */
 }
 
 /*
@@ -291,17 +282,6 @@ shell_find_by_bp(struct buffer *bp)
 	return (NULL);
 }
 
-static struct shellproc *
-shell_find_by_pid(pid_t pid)
-{
-	struct shellproc *sp;
-
-	for (sp = shells; sp != NULL; sp = sp->next)
-		if (sp->pid == pid)
-			return (sp);
-	return (NULL);
-}
-
 static void
 shell_remove(struct shellproc *sp)
 {
@@ -317,21 +297,26 @@ shell_remove(struct shellproc *sp)
 }
 
 /*
- * Reap any children flagged by shell_sigchld. For each of our shells that
- * died, drain remaining bytes from its fd, close it, and drop a "finished"
- * marker into the buffer.
+ * Walk our own shell list and reap any child that has become a zombie.
+ * We iterate known pids and waitpid() each with WNOHANG, rather than
+ * waitpid(-1, ...) which would greedily consume dead term children too
+ * (leaving term.c's own sp list orphaned). When a child is gone, drain
+ * any last bytes, close the fd, drop a "finished" marker, unset the
+ * shell mode on the buffer so it becomes plain editable text, and
+ * remove sp.
  */
 static void
 shell_reap(void)
 {
 	int		  status;
-	pid_t		  pid;
-	struct shellproc *sp;
+	struct shellproc *sp, *next;
+	struct buffer	 *saved_bp;
 
-	shell_chld_flag = 0;
-	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-		sp = shell_find_by_pid(pid);
-		if (sp == NULL)
+	for (sp = shells; sp != NULL; sp = next) {
+		next = sp->next;
+		if (sp->pid <= 0)
+			continue;
+		if (waitpid(sp->pid, &status, WNOHANG) != sp->pid)
 			continue;
 		(void)shell_read(sp);
 		if (sp->fd >= 0) {
@@ -340,6 +325,15 @@ shell_reap(void)
 		}
 		shell_finish_message(sp->bp);
 		shell_touch_windows(sp->bp);
+		/*
+		 * Drop shell mode so the buffer becomes a normal editable
+		 * text buffer: user can M-x, edit, copy, or re-run shell
+		 * to relaunch fresh.
+		 */
+		saved_bp = curbp;
+		curbp = sp->bp;
+		(void)changemode(FFARG, -1, "shell");
+		curbp = saved_bp;
 		shell_remove(sp);
 	}
 }
@@ -640,8 +634,7 @@ shell_wait_for_input(void)
 	struct shellproc *sp, *sps[SHELL_MAX_PROCS];
 	int		  nfds, i, r, changed, rc;
 
-	if (shell_chld_flag)
-		shell_reap();
+	shell_reap();
 	if (shells == NULL)
 		return;
 
@@ -664,14 +657,19 @@ shell_wait_for_input(void)
 		r = poll(pfds, 1 + nfds, -1);
 		if (r == -1) {
 			if (errno == EINTR) {
-				if (shell_chld_flag)
-					shell_reap();
+				shell_reap();
 				return;
 			}
 			return;
 		}
-		if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))
-			return;
+		/*
+		 * Drain fd events FIRST, even if stdin is also ready.
+		 * A shell that just POLLHUP'd (exit) simultaneously with
+		 * a user keypress would otherwise leave sp->fd open long
+		 * enough for the queued key to be dispatched under the
+		 * still-active shell mode -- and shell_send_input to write
+		 * to a dying fd. Reap here, drop the mode, then return.
+		 */
 		changed = 0;
 		for (i = 0; i < nfds; i++) {
 			if (!(pfds[1 + i].revents &
@@ -688,12 +686,13 @@ shell_wait_for_input(void)
 				changed = 1;
 			}
 		}
-		if (shell_chld_flag)
-			shell_reap();
+		shell_reap();
 		if (changed) {
 			update(CMODE);
 			ttflush();
 		}
+		if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))
+			return;
 		if (shells == NULL)
 			return;
 	}

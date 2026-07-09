@@ -996,6 +996,42 @@ command.
 .It Ic set-tab-width
 Set the tab width for the current buffer, or the default for new buffers
 if called with a prefix argument or from the startup file.
+.It Ic shell
+Start (or switch to) an interactive shell in a buffer named
+.Pa *shell* .
+Spawns
+.Ev SHELL
+(falling back to
+.Pa /bin/sh )
+on a pseudo-terminal with
+.Ev TERM
+set to
+.Dq dumb ,
+drains its output asynchronously into the buffer, and rebinds a few
+keys under the
+.Ic shell
+minor mode:
+.Ic shell-send-input
+on
+.Aq RET ,
+.Ic shell-interrupt
+on
+.Aq C-c C-c ,
+and
+.Ic shell-send-eof
+on
+.Aq C-c C-d .
+Not a terminal emulator: SGR (colour) escapes are stripped and other
+escape sequences pass through raw; for full-screen curses applications
+use
+.Ic term
+instead.
+When invoked in an existing
+.Pa *shell*
+buffer whose process is still alive, this command simply switches to
+it.
+If the previous shell has exited, the buffer is cleared and a fresh
+shell is launched.
 .It Ic shell-command
 Execute external command from mini-buffer.
 With a universal argument it inserts the command output into the current
@@ -1004,6 +1040,46 @@ buffer.
 Provide the text in region to the shell command as input.
 With a universal argument it replaces the region with the command
 output.
+.It Ic shell-interrupt
+Send
+.Dv SIGINT
+to the shell running in the current
+.Pa *shell*
+buffer.
+Bound by default to
+.Aq C-c C-c
+in
+.Ic shell
+mode.
+Does nothing if the buffer has no live shell.
+.It Ic shell-send-eof
+Write a
+.Aq C-d
+byte
+.Pq Dv VEOF
+to the shell running in the current
+.Pa *shell*
+buffer, which the line discipline delivers as end-of-file to the
+foreground reader.
+Bound by default to
+.Aq C-c C-d
+in
+.Ic shell
+mode.
+Does nothing if the buffer has no live shell.
+.It Ic shell-send-input
+Send everything between the process-mark and end-of-buffer to the
+shell running in the current
+.Pa *shell*
+buffer, terminated by a newline, and re-anchor the process-mark at
+the new end of buffer.
+Bound by default to
+.Aq RET
+in
+.Ic shell
+mode.
+Falls back to inserting a plain newline if the buffer has no live
+shell, so the buffer remains editable after the process exits.
 .It Ic shrink-window
 Shrink current window by one line.
 The window immediately below is expanded to pick up the slack.
@@ -1037,6 +1113,98 @@ and switch back to alternate screen, if in use.
 Prompt and switch to a new buffer in the current window.
 .It Ic switch-to-buffer-other-window
 Switch to buffer in another window.
+.It Ic term
+Start (or switch to) an interactive terminal-emulator buffer named
+.Pa *term* .
+Prompts for the program to run with
+.Ev SHELL
+(falling back to
+.Pa /bin/sh )
+as the pre-filled default; the input is split on whitespace and passed
+to
+.Xr execvp 3 ,
+so bare command names are resolved against
+.Ev PATH .
+The program is spawned on a pseudo-terminal with
+.Ev TERM
+set to
+.Dq ansi ,
+its output is driven through a VT100/ANSI subset (cursor addressing,
+erase-in-line, erase-in-display, insert/delete line and character,
+scroll region, save/restore cursor; SGR colour attributes are parsed
+and dropped), and every keystroke you type is forwarded straight to
+the program in char mode.
+The
+.Aq C-c
+prefix is reserved for term-command bindings
+.Pq Ic term-interrupt No and Ic term-kill-process ;
+the
+.Aq C-x
+prefix remains bound to
+.Nm Ns 's
+usual
+.Dq C-x
+map so that
+.Ic switch-to-buffer ,
+.Ic kill-buffer ,
+and friends still work as escape hatches.
+When invoked in an existing
+.Pa *term*
+buffer whose process is still alive, this command simply switches to
+it.
+If the previous program has exited, the buffer is cleared and the
+prompt appears again for a fresh session.
+Suitable for hosting full-screen curses applications
+.Pq e.g.\& Xr vi 1 , Xr less 1 , Xr top 1 ;
+alternate-screen switching
+.Pq Dv smcup Ns / Ns Dv rmcup
+is currently ignored, so those programs write directly to the main
+buffer.
+.It Ic term-interrupt
+Write a
+.Aq C-c
+byte
+.Pq Dv VINTR
+to the terminal running in the current
+.Pa *term*
+buffer, which the line discipline delivers as
+.Dv SIGINT
+to the foreground process group.
+Bound by default to
+.Aq C-c C-c
+in
+.Ic term
+mode.
+Does nothing if the buffer has no live terminal.
+.It Ic term-kill-process
+Terminate the program running in the current
+.Pa *term*
+buffer:
+.Dv SIGHUP
+is sent, and if the child does not exit within roughly a quarter of a
+second it is followed by
+.Dv SIGKILL .
+The buffer is then marked with a
+.Dq Process term finished
+line and the
+.Ic term
+minor mode is removed, leaving the buffer as plain editable text.
+Bound by default to
+.Aq C-c C-k
+in
+.Ic term
+mode.
+.It Ic term-send-char
+Forward the last keystroke to the terminal running in the current
+.Pa *term*
+buffer as a single raw byte.
+This is the default handler in
+.Ic term
+mode's char-mode keymap and normally is not invoked directly.
+If the terminal has already exited it delegates to the buffer's
+underlying keymap so that ordinary
+.Nm
+editing resumes without dropping the key.
 .It Ic toggle-read-only
 Toggle the read-only flag on the current buffer.
 .It Ic toggle-read-only-all

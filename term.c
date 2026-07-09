@@ -128,7 +128,6 @@ struct termproc {
 };
 
 static struct termproc *terms;
-static volatile sig_atomic_t term_chld_flag;
 static int term_initialized;
 
 void	term_init(void);
@@ -141,11 +140,9 @@ void	term_buffer_killed(struct buffer *);
 void	term_kill_all(void);
 void	term_notify_resize(void);
 
-static void term_sigchld(int);
 static void term_reap(void);
 static void term_remove(struct termproc *);
 static struct termproc *term_find_by_bp(struct buffer *);
-static struct termproc *term_find_by_pid(pid_t);
 
 static int  term_read(struct termproc *);
 static void term_feed(struct termproc *, unsigned char);
@@ -222,8 +219,6 @@ static struct KEYMAPE (2) termmap = {
 void
 term_init(void)
 {
-	struct sigaction sa;
-
 	if (term_initialized)
 		return;
 	term_initialized = 1;
@@ -233,25 +228,13 @@ term_init(void)
 	funmap_add(term_interrupt, "term-interrupt", 0);
 	funmap_add(term_kill_process, "term-kill-process", 0);
 	maps_add((KEYMAP *)&termmap, "term");
-
 	/*
-	 * We share SIGCHLD with shell.c. Whichever module's handler runs
-	 * first sets its flag; each module's reaper waitpid()s only for
-	 * pids it owns, so we can safely install a handler here too and
-	 * let both flags get polled independently.
+	 * No SIGCHLD handler: default SIG_DFL leaves dead children as
+	 * zombies until term_reap() waitpid()s them per-pid on every
+	 * term_wait_for_input entry. See shell.c for the matching setup
+	 * and the rationale (an earlier sigaction race between the two
+	 * modules made either module's children leak).
 	 */
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = term_sigchld;
-	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-	sigemptyset(&sa.sa_mask);
-	(void)sigaction(SIGCHLD, &sa, NULL);
-}
-
-static void
-term_sigchld(int signo)
-{
-	(void)signo;
-	term_chld_flag = 1;
 }
 
 /*
@@ -445,17 +428,6 @@ term_find_by_bp(struct buffer *bp)
 	return (NULL);
 }
 
-static struct termproc *
-term_find_by_pid(pid_t pid)
-{
-	struct termproc *sp;
-
-	for (sp = terms; sp != NULL; sp = sp->next)
-		if (sp->pid == pid)
-			return (sp);
-	return (NULL);
-}
-
 static void
 term_remove(struct termproc *sp)
 {
@@ -471,21 +443,25 @@ term_remove(struct termproc *sp)
 }
 
 /*
- * Reap any dead children flagged by term_sigchld. For each of our
- * terms that died, drain remaining bytes, close, and drop a marker
- * line.
+ * Walk our own term list and reap any child that has become a zombie.
+ * We waitpid() each known pid with WNOHANG rather than waitpid(-1, ...)
+ * so we don't consume shell.c's dead children (or vice versa). When a
+ * child is gone, drain remaining bytes, close the fd, drop a marker
+ * line, unset the term mode so the buffer becomes plain editable text,
+ * and remove sp.
  */
 static void
 term_reap(void)
 {
 	int		 status;
-	pid_t		 pid;
-	struct termproc	*sp;
+	struct termproc	*sp, *next;
+	struct buffer	*saved_bp;
 
-	term_chld_flag = 0;
-	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-		sp = term_find_by_pid(pid);
-		if (sp == NULL)
+	for (sp = terms; sp != NULL; sp = next) {
+		next = sp->next;
+		if (sp->pid <= 0)
+			continue;
+		if (waitpid(sp->pid, &status, WNOHANG) != sp->pid)
 			continue;
 		(void)term_read(sp);
 		if (sp->fd >= 0) {
@@ -494,6 +470,17 @@ term_reap(void)
 		}
 		term_finish_message(sp->bp);
 		term_touch_windows(sp->bp);
+		/*
+		 * Drop term mode so ESC / M-x / motion commands stop
+		 * going through term_send_char (which would swallow them
+		 * with sp gone). Buffer becomes plain editable text, and
+		 * `M-x term` from anywhere -- including this very buffer
+		 * -- can relaunch fresh.
+		 */
+		saved_bp = curbp;
+		curbp = sp->bp;
+		(void)changemode(FFARG, -1, "term");
+		curbp = saved_bp;
 		term_remove(sp);
 	}
 }
@@ -1282,8 +1269,7 @@ term_wait_for_input(void)
 	struct termproc *sp, *sps[TERM_MAX_PROCS];
 	int		 nfds, i, r, changed, rc;
 
-	if (term_chld_flag)
-		term_reap();
+	term_reap();
 	if (terms == NULL)
 		return;
 
@@ -1306,14 +1292,23 @@ term_wait_for_input(void)
 		r = poll(pfds, 1 + nfds, -1);
 		if (r == -1) {
 			if (errno == EINTR) {
-				if (term_chld_flag)
-					term_reap();
+				term_reap();
 				return;
 			}
 			return;
 		}
-		if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))
-			return;
+		/*
+		 * Drain fd events FIRST, even if stdin is also ready.
+		 * Otherwise a PTY that just POLLHUP'd (child exit) at the
+		 * same instant the user pressed a key would be left with
+		 * sp->fd still >= 0; the key would dispatch through term
+		 * mode's map_default -> term_send_char, and either write
+		 * to a nearly-dead PTY (whose tty flags may echo it back
+		 * as visible junk) or corrupt the buffer. Handle the
+		 * POLLHUP first, close the fd, reap, drop the mode -- then
+		 * return so ttgetc can read the queued key under the
+		 * post-reap (fundamental) keymap.
+		 */
 		changed = 0;
 		for (i = 0; i < nfds; i++) {
 			if (!(pfds[1 + i].revents &
@@ -1330,12 +1325,13 @@ term_wait_for_input(void)
 				changed = 1;
 			}
 		}
-		if (term_chld_flag)
-			term_reap();
+		term_reap();
 		if (changed) {
 			update(CMODE);
 			ttflush();
 		}
+		if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))
+			return;
 		if (terms == NULL)
 			return;
 	}
@@ -1356,8 +1352,21 @@ term_send_char(int f, int n)
 	int		 i;
 
 	sp = term_find_by_bp(curbp);
-	if (sp == NULL || sp->fd < 0)
-		return (FALSE);
+	if (sp == NULL || sp->fd < 0) {
+		/*
+		 * Reaped mid-dispatch: doin() captured termmap as curmap
+		 * before term_reap() ran (during ttgetc's poll), removed
+		 * the mode, and freed sp. Simply returning FALSE would
+		 * silently drop the byte -- which is fatal for ESC (M-x
+		 * disappears; the follow-up x/t/e/r/m each self-insert
+		 * under the now-fundamental chain, leaving 'xterm' as
+		 * buffer garbage). Delegate to rescan so mg re-walks the
+		 * *current* (post-reap) mode stack: ESC becomes a proper
+		 * prefix into metamap, printable chars self-insert
+		 * cleanly, etc.
+		 */
+		return (rescan(f, n));
+	}
 	if (key.k_count <= 0)
 		return (FALSE);
 	c = (unsigned char)key.k_chars[key.k_count - 1];
