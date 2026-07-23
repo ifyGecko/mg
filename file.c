@@ -216,8 +216,7 @@ readin(char *fname)
 		if (wp->w_bufp == curbp) {
 			wp->w_dotp = wp->w_linep = bfirstlp(curbp);
 			wp->w_doto = 0;
-			wp->w_markp = NULL;
-			wp->w_marko = 0;
+			mark_clear_wp(wp);
 		}
 	}
 
@@ -437,10 +436,17 @@ endoffile:
 		else
 			ewprintf("(Read %d lines)", nline);
 	}
-	/* set mark at the end of the text */
+	/*
+	 * Bookmark the end of the inserted text so C-x C-x jumps there;
+	 * this must NOT activate the region -- otherwise the whole
+	 * inserted file would render highlighted and cursor motion would
+	 * extend the highlight.  Matches Emacs's push-mark-nomsg-noactivate.
+	 */
 	curwp->w_dotp = curwp->w_markp = lback(curwp->w_dotp);
 	curwp->w_marko = llength(curwp->w_markp);
 	curwp->w_markline = oline + nline + 1;
+	curwp->w_markactive = 0;
+	curwp->w_rflag |= WFFULL;
 	/*
 	 * if we are at the end of the file, ldelnewline is a no-op,
 	 * but we still need to decrement the line and markline counts

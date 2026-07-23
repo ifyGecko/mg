@@ -277,8 +277,10 @@ killpara(int f, int n)
 
 	/* take a note of the line number for after deletions and set mark */
 	lineno = curwp->w_dotline;
-	curwp->w_markp = curwp->w_dotp;
-	curwp->w_marko = curwp->w_doto;
+	/* Non-activating: the mark is only used internally by killregion
+	 * below and is cleared by that call.  Any highlight would be a
+	 * flash between here and killregion. */
+	mark_push(curwp);
 
 	(void)gotoeop(FFRAND, n);
 
@@ -309,9 +311,10 @@ markpara(int f, int n)
 
 	(void)do_gotoeop(FFRAND, n, &i);
 
-	/* set the mark here */
-	curwp->w_markp = curwp->w_dotp;
-	curwp->w_marko = curwp->w_doto;
+	/* Activate the region: markpara is a user "select paragraph"
+	 * command, analogous to Emacs mark-paragraph.  The highlight
+	 * should show. */
+	mark_activate(curwp);
 
 	(void)gotobop(FFRAND, i);
 
@@ -334,10 +337,11 @@ transposepara(int f, int n)
 
 	undo_boundary_enable(FFRAND, 0);
 
-	/* find a paragraph, set mark, then goto the end */
+	/* find a paragraph, set mark, then goto the end.  Non-activating
+	 * push: killregion below consumes the mark; any interim highlight
+	 * would just be flicker. */
 	gotobop(FFRAND, 1);
-	curwp->w_markp = curwp->w_dotp;
-	curwp->w_marko = curwp->w_doto;
+	mark_push(curwp);
 	(void)gotoeop(FFRAND, 1);
 
 	/* take a note of buffer flags - we may need them */

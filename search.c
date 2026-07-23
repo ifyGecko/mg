@@ -204,23 +204,28 @@ isearch(int dir)
 			/*
 			 * If new characters arrive within 300 msec, this
 			 * ESC is the lead byte of a longer escape sequence
-			 * (e.g. an arrow key). Push it back so the main
-			 * command loop can read the full sequence, and exit
-			 * isearch without setting the mark -- the user is
-			 * moving point, not marking a region.
+			 * (e.g. an arrow key).  Push it back so the main
+			 * command loop can read the full sequence, then
+			 * fall through to the normal isearch-exit path.
+			 * The mark is pushed at the isearch start position
+			 * as a bookmark (not activated), matching Emacs;
+			 * previously this path skipped the push to avoid
+			 * a phantom highlight -- now the display gate on
+			 * w_markactive prevents any highlight regardless.
 			 */
-			if (ttwait(300) == FALSE) {
+			if (ttwait(300) == FALSE)
 				ungetkey(c);
-				srch_lastdir = dir;
-				return (TRUE);
-			}
 			/* FALLTHRU */
 		case CCHR('M'):
 			srch_lastdir = dir;
+			/* Bookmark the isearch start position; do not
+			 * activate the region.  C-x C-x will still jump
+			 * back to where the search began. */
 			curwp->w_markp = clp;
 			curwp->w_marko = cbo;
 			curwp->w_markline = cdotline;
-			ewprintf("Mark set");
+			curwp->w_markactive = 0;
+			curwp->w_rflag |= WFFULL;
 			return (TRUE);
 		case CCHR('G'):
 			if (success != TRUE) {
@@ -368,18 +373,22 @@ isearch(int dir)
 				/*
 				 * Unhandled control character (e.g. C-b,
 				 * C-f, C-n, C-p): the user is exiting
-				 * isearch to move point or run a command,
-				 * not to mark a region. Push it back for
-				 * the main command loop and exit without
-				 * setting the mark -- otherwise the
-				 * subsequent motion would highlight the
-				 * region from the isearch start position
-				 * (often the previous match) to the new
-				 * point. Mirrors the ESC arrow-key
-				 * handling above.
+				 * isearch to move point or run a command.
+				 * Push the character back for the main
+				 * command loop and bookmark the isearch
+				 * start position (not activated) so C-x
+				 * C-x can jump back.  Previously this path
+				 * skipped the mark push to avoid a phantom
+				 * highlight; the display gate on
+				 * w_markactive now makes the push safe.
 				 */
 				ungetkey(c);
 				srch_lastdir = dir;
+				curwp->w_markp = clp;
+				curwp->w_marko = cbo;
+				curwp->w_markline = cdotline;
+				curwp->w_markactive = 0;
+				curwp->w_rflag |= WFFULL;
 				return (TRUE);
 			}
 			/* FALLTHRU */
@@ -908,7 +917,8 @@ zap(int including, int n)
 	pat[0] = (char)s;
 	pat[1] = '\0';
 
-	isetmark();
+	/* Bookmark the zap origin so killregion below has a start. */
+	mark_push(curwp);
 	while (n--) {
 		s = backward ? backsrch() : forwsrch();
 		if (s != TRUE) {

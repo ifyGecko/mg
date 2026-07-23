@@ -118,7 +118,7 @@ int
 gotobob(int f, int n)
 {
 	if (!curwp->w_markp)
-		(void) setmark(f, n);
+		mark_push(curwp);
 	curwp->w_dotp = bfirstlp(curbp);
 	curwp->w_doto = 0;
 	curwp->w_rflag |= WFFULL;
@@ -145,7 +145,7 @@ gotoeob(int f, int n)
 	struct line	*lp;
 
 	if (!curwp->w_markp)
-		(void) setmark(f, n);
+		mark_push(curwp);
 	curwp->w_dotp = blastlp(curbp);
 	curwp->w_doto = llength(curwp->w_dotp);
 	curwp->w_dotline = curwp->w_bufp->b_lines;
@@ -431,14 +431,140 @@ pagenext(int f, int n)
 }
 
 /*
- * Internal set mark routine, used by other functions (daveb).
+ * Mark model:  a window has two related but distinct concepts of "mark":
+ *
+ *   1. w_markp/w_marko/w_markline -- the mark's *position*.  Set means the
+ *      user (or an internal command) recorded a location we might jump to
+ *      or operate on later (region ops, C-x C-x, etc.).
+ *
+ *   2. w_markactive -- whether that mark should render as a highlighted
+ *      region.  Only true when the user explicitly activated the region
+ *      via set-mark-command (C-SPC).
+ *
+ * All internal "push mark for later" call sites (yank, gotobob, gotoeob,
+ * insert-file, isearch exit, zap-to-char, kill-paragraph, transpose-para,
+ * ...) must use mark_push(): it records the position without turning on
+ * the highlight.  Historically these all called isetmark(), which set the
+ * mark unconditionally, and because paint_region() only checked whether
+ * w_markp was non-NULL, every one of those pushes produced a phantom
+ * highlight that grew when the user moved point.  The dedicated
+ * mark_activate() call is used only by set-mark-command; the display gate
+ * is w_markactive, so no push can create a highlight by accident.
+ *
+ * All raw "wp->w_markp = X" writes go through helpers below so the active
+ * bit is kept in sync automatically.  Line-splice fixups (line.c/shell.c/
+ * file.c) that merely retarget the pointer when a struct line is replaced
+ * use mark_relocate(), which preserves the active state.
+ */
+
+/*
+ * Push the mark at dot without activating a region highlight.  Used by
+ * commands that leave a "come back here" bookmark: yank, gotobob/gotoeob,
+ * insert-file, isearch exit, zap-to-char, kill-paragraph, ...
+ */
+void
+mark_push(struct mgwin *wp)
+{
+	int was_active = (wp->w_markp != NULL) && wp->w_markactive;
+	wp->w_markp = wp->w_dotp;
+	wp->w_marko = wp->w_doto;
+	wp->w_markline = wp->w_dotline;
+	wp->w_markactive = 0;
+	if (was_active)
+		wp->w_rflag |= WFFULL;	/* drop old highlight */
+}
+
+/*
+ * Set the mark at dot and activate the region highlight.  Only
+ * set-mark-command and other explicit "make a selection" commands
+ * (e.g. mark-paragraph) call this.
+ */
+void
+mark_activate(struct mgwin *wp)
+{
+	wp->w_markp = wp->w_dotp;
+	wp->w_marko = wp->w_doto;
+	wp->w_markline = wp->w_dotline;
+	wp->w_markactive = 1;
+	wp->w_rflag |= WFFULL;
+}
+
+/* Clear the mark on a specific window (internal form of clearmark). */
+void
+mark_clear_wp(struct mgwin *wp)
+{
+	if (wp->w_markp == NULL && wp->w_markactive == 0)
+		return;
+	wp->w_markp = NULL;
+	wp->w_marko = 0;
+	wp->w_markline = 0;
+	wp->w_markactive = 0;
+	wp->w_rflag |= WFFULL;
+}
+
+/*
+ * Retarget the mark's line pointer to a replacement line, preserving the
+ * active state.  For structural line-splice fixups only -- callers that
+ * merely rebase w_markp to follow a lalloc/ldelete/lnewline should use
+ * this instead of a raw write.
+ */
+void
+mark_relocate(struct mgwin *wp, struct line *lp, int off)
+{
+	wp->w_markp = lp;
+	wp->w_marko = off;
+	/* markline is caller's responsibility (line arithmetic varies). */
+}
+
+/*
+ * Copy the window's mark (position + active state) into the buffer's
+ * stash.  Called when a window releases a buffer (b_nwnd drops to 0).
+ */
+void
+mark_save_to_buffer(struct mgwin *wp, struct buffer *bp)
+{
+	bp->b_markp = wp->w_markp;
+	bp->b_marko = wp->w_marko;
+	bp->b_markline = wp->w_markline;
+	bp->b_markactive = wp->w_markactive;
+}
+
+/*
+ * Restore a mark stashed on the buffer into the window.  Used when a
+ * window attaches to a buffer that no other window currently displays.
+ */
+void
+mark_load_from_buffer(struct mgwin *wp, struct buffer *bp)
+{
+	wp->w_markp = bp->b_markp;
+	wp->w_marko = bp->b_marko;
+	wp->w_markline = bp->b_markline;
+	wp->w_markactive = bp->b_markactive;
+}
+
+/*
+ * Copy dot/mark state from one window to another.  Used when a new
+ * window is created showing the same buffer already displayed elsewhere
+ * (split, buffer-already-visible in showbuffer).
+ */
+void
+mark_copy_from_window(struct mgwin *dst, struct mgwin *src)
+{
+	dst->w_markp = src->w_markp;
+	dst->w_marko = src->w_marko;
+	dst->w_markline = src->w_markline;
+	dst->w_markactive = src->w_markactive;
+}
+
+/*
+ * Legacy shim: previously the sole "internal set mark" routine.  Kept as
+ * a thin wrapper delegating to mark_push() so any straggling caller has
+ * the fixed non-activating semantics.
  */
 void
 isetmark(void)
 {
-	curwp->w_markp = curwp->w_dotp;
-	curwp->w_marko = curwp->w_doto;
-	curwp->w_markline = curwp->w_dotline;
+	mark_push(curwp);
 }
 
 /*
@@ -459,7 +585,7 @@ setmark(int f, int n)
 		ewprintf("Mark deactivated");
 		return (TRUE);
 	}
-	isetmark();
+	mark_activate(curwp);
 	ewprintf("Mark set");
 	return (TRUE);
 }
@@ -468,13 +594,12 @@ setmark(int f, int n)
 int
 clearmark(int f, int n)
 {
-	if (!curwp->w_markp)
+	if (!curwp->w_markp && !curwp->w_markactive)
 		return (FALSE);
 
-	curwp->w_markp = NULL;
-	curwp->w_marko = 0;
+	mark_clear_wp(curwp);
 	curbp->b_markline = 0;
-	curwp->w_rflag |= WFFULL;	/* repaint to drop stale CHILIGHT */
+	curbp->b_markactive = 0;
 
 	return (TRUE);
 }

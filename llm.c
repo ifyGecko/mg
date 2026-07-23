@@ -80,6 +80,7 @@ static struct {
 	struct buffer	*src_bp;
 	struct buffer	*prompt_bp;
 	int		 has_region;
+	int		 mark_was_active;
 	int		 dot_lineno;
 	int		 dot_offset;
 	int		 mark_lineno;
@@ -854,6 +855,7 @@ llm(int f, int n)
 	llm_session.src_bp = src_bp;
 	llm_session.prompt_bp = prompt_bp;
 	llm_session.has_region = (curwp->w_markp != NULL);
+	llm_session.mark_was_active = curwp->w_markactive;
 	llm_session.dot_lineno = curwp->w_dotline;
 	llm_session.dot_offset = curwp->w_doto;
 	llm_session.mark_lineno = curwp->w_markline;
@@ -867,9 +869,7 @@ llm(int f, int n)
 	curwp->w_dotp = bfirstlp(prompt_bp);
 	curwp->w_doto = 0;
 	curwp->w_dotline = 1;
-	curwp->w_markp = NULL;
-	curwp->w_marko = 0;
-	curwp->w_markline = 1;
+	mark_clear_wp(curwp);
 	curwp->w_linep = curwp->w_dotp;
 
 	ewprintf("LLM: type prompt; C-c C-c to send, C-c C-k to abort");
@@ -940,10 +940,10 @@ llm_compose_send(int f, int n)
 		if (curwp->w_marko > llength(mark_lp))
 			curwp->w_marko = llength(mark_lp);
 		curwp->w_markline = llm_session.mark_lineno;
+		curwp->w_markactive = llm_session.mark_was_active;
+		curwp->w_rflag |= WFFULL;
 	} else {
-		curwp->w_markp = NULL;
-		curwp->w_marko = 0;
-		curwp->w_markline = 1;
+		mark_clear_wp(curwp);
 	}
 	curwp->w_linep = dot_lp;
 
@@ -996,6 +996,9 @@ llm_compose_abort(int f, int n)
 				if (curwp->w_marko > llength(mark_lp))
 					curwp->w_marko = llength(mark_lp);
 				curwp->w_markline = llm_session.mark_lineno;
+				curwp->w_markactive =
+				    llm_session.mark_was_active;
+				curwp->w_rflag |= WFFULL;
 			}
 			curwp->w_linep = dot_lp;
 		}

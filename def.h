@@ -224,6 +224,8 @@ struct mgwin {
 	struct line	*w_wrapline;
 	int		 w_dotline;	/* current line number of dot	*/
 	int		 w_markline;	/* current line number of mark	*/
+	int		 w_markactive;	/* 1 = highlight region; 0 =	*/
+					/* mark is a bookmark only.	*/
 };
 
 #define WRIGHT(wp)	((wp)->w_leftcol + (wp)->w_ncols)
@@ -297,6 +299,7 @@ struct buffer {
 	struct undo_rec *b_undoptr;
 	int		 b_dotline;	/* Line number of dot */
 	int		 b_markline;	/* Line number of mark */
+	int		 b_markactive;	/* Saved w_markactive for buffer */
 	int		 b_lines;	/* Number of lines in file	*/
 	char		 b_cmtstr[PREFIXLENGTH]; /* per-buffer comment string */
 };
@@ -572,6 +575,17 @@ void		 isetmark(void);
 int		 setmark(int, int);
 int		 clearmark(int, int);
 int		 swapmark(int, int);
+/*
+ * Mark helpers.  See the comment atop mark_push() in basic.c for the
+ * "bookmark vs. active region" distinction that these enforce.
+ */
+void		 mark_push(struct mgwin *);
+void		 mark_activate(struct mgwin *);
+void		 mark_clear_wp(struct mgwin *);
+void		 mark_relocate(struct mgwin *, struct line *, int);
+void		 mark_save_to_buffer(struct mgwin *, struct buffer *);
+void		 mark_load_from_buffer(struct mgwin *, struct buffer *);
+void		 mark_copy_from_window(struct mgwin *, struct mgwin *);
 int		 gotoline(int, int);
 int		 setlineno(int);
 

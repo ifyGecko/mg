@@ -236,8 +236,11 @@ yank(int f, int n)
 
 	undo_boundary_enable(FFRAND, 0);
 	while (n--) {
-		/* mark around last yank */
-		isetmark();
+		/* Push mark at start of yank so C-x C-x jumps back;
+		 * do NOT activate the region -- otherwise the pasted
+		 * text would render highlighted and cursor motion after
+		 * the paste would extend the highlight. */
+		mark_push(curwp);
 		i = 0;
 		while ((c = kremove(i)) >= 0) {
 			if (c == *curbp->b_nlchr) {

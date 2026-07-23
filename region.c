@@ -37,13 +37,16 @@ static	int	shellcmdoutput(char * const, char * const, int,
 		    struct buffer *);
 
 /*
- * Is the mark set and the region between dot and mark non-empty?
- * Used by backspace/delete to decide whether to operate on the region.
+ * Is the region highlighted and non-empty?  Used by backspace/delete to
+ * decide whether to operate on the region.  Deliberately requires the
+ * mark to be *active* (w_markactive) so a bookmark-style mark pushed by
+ * yank/insert-file/gotobob/... does not silently turn the next backspace
+ * into a giant region deletion.
  */
 int
 region_active_nonempty(void)
 {
-	if (curwp->w_markp == NULL)
+	if (curwp->w_markp == NULL || !curwp->w_markactive)
 		return (FALSE);
 	if (curwp->w_markp == curwp->w_dotp &&
 	    curwp->w_marko == curwp->w_doto)

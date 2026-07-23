@@ -721,6 +721,7 @@ bclear(struct buffer *bp)
 	bp->b_doto = 0;
 	bp->b_markp = NULL;	/* Invalidate "mark"	 */
 	bp->b_marko = 0;
+	bp->b_markactive = 0;
 	bp->b_dotline = bp->b_markline = 1;
 	bp->b_lines = 1;
 
@@ -750,10 +751,8 @@ showbuffer(struct buffer *bp, struct mgwin *wp, int flags)
 		if (--obp->b_nwnd == 0) {
 			obp->b_dotp = wp->w_dotp;
 			obp->b_doto = wp->w_doto;
-			obp->b_markp = wp->w_markp;
-			obp->b_marko = wp->w_marko;
 			obp->b_dotline = wp->w_dotline;
-			obp->b_markline = wp->w_markline;
+			mark_save_to_buffer(wp, obp);
 		}
 	}
 	/* Now, attach the new buffer to the window */
@@ -762,20 +761,16 @@ showbuffer(struct buffer *bp, struct mgwin *wp, int flags)
 	if (bp->b_nwnd++ == 0) {	/* First use.		 */
 		wp->w_dotp = bp->b_dotp;
 		wp->w_doto = bp->b_doto;
-		wp->w_markp = bp->b_markp;
-		wp->w_marko = bp->b_marko;
 		wp->w_dotline = bp->b_dotline;
-		wp->w_markline = bp->b_markline;
+		mark_load_from_buffer(wp, bp);
 	} else
 		/* already on screen, steal values from other window */
 		for (owp = wheadp; owp != NULL; owp = wp->w_wndp)
 			if (wp->w_bufp == bp && owp != wp) {
 				wp->w_dotp = owp->w_dotp;
 				wp->w_doto = owp->w_doto;
-				wp->w_markp = owp->w_markp;
-				wp->w_marko = owp->w_marko;
 				wp->w_dotline = owp->w_dotline;
-				wp->w_markline = owp->w_markline;
+				mark_copy_from_window(wp, owp);
 				break;
 			}
 	wp->w_rflag |= WFMODE | flags;

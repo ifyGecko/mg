@@ -358,10 +358,8 @@ collapse_to_curwp(void)
 		if (--wp->w_bufp->b_nwnd == 0) {
 			wp->w_bufp->b_dotp = wp->w_dotp;
 			wp->w_bufp->b_doto = wp->w_doto;
-			wp->w_bufp->b_markp = wp->w_markp;
-			wp->w_bufp->b_marko = wp->w_marko;
 			wp->w_bufp->b_dotline = wp->w_dotline;
-			wp->w_bufp->b_markline = wp->w_markline;
+			mark_save_to_buffer(wp, wp->w_bufp);
 		}
 		free(wp);
 	}
@@ -371,10 +369,8 @@ collapse_to_curwp(void)
 		if (--wp->w_bufp->b_nwnd == 0) {
 			wp->w_bufp->b_dotp = wp->w_dotp;
 			wp->w_bufp->b_doto = wp->w_doto;
-			wp->w_bufp->b_markp = wp->w_markp;
-			wp->w_bufp->b_marko = wp->w_marko;
 			wp->w_bufp->b_dotline = wp->w_dotline;
-			wp->w_bufp->b_markline = wp->w_markline;
+			mark_save_to_buffer(wp, wp->w_bufp);
 		}
 		free(wp);
 	}
@@ -684,10 +680,8 @@ onlywind(int f, int n)
 		if (--wp->w_bufp->b_nwnd == 0) {
 			wp->w_bufp->b_dotp = wp->w_dotp;
 			wp->w_bufp->b_doto = wp->w_doto;
-			wp->w_bufp->b_markp = wp->w_markp;
-			wp->w_bufp->b_marko = wp->w_marko;
 			wp->w_bufp->b_dotline = wp->w_dotline;
-			wp->w_bufp->b_markline = wp->w_markline;
+			mark_save_to_buffer(wp, wp->w_bufp);
 		}
 		free(wp);
 	}
@@ -697,10 +691,8 @@ onlywind(int f, int n)
 		if (--wp->w_bufp->b_nwnd == 0) {
 			wp->w_bufp->b_dotp = wp->w_dotp;
 			wp->w_bufp->b_doto = wp->w_doto;
-			wp->w_bufp->b_markp = wp->w_markp;
-			wp->w_bufp->b_marko = wp->w_marko;
 			wp->w_bufp->b_dotline = wp->w_dotline;
-			wp->w_bufp->b_markline = wp->w_markline;
+			mark_save_to_buffer(wp, wp->w_bufp);
 		}
 		free(wp);
 	}
@@ -751,10 +743,8 @@ splitwind(int f, int n)
 	/* use the current dot and mark */
 	wp->w_dotp = curwp->w_dotp;
 	wp->w_doto = curwp->w_doto;
-	wp->w_markp = curwp->w_markp;
-	wp->w_marko = curwp->w_marko;
 	wp->w_dotline = curwp->w_dotline;
-	wp->w_markline = curwp->w_markline;
+	mark_copy_from_window(wp, curwp);
 
 	/* horizontal split: inherit column geometry and band weight */
 	wp->w_leftcol = curwp->w_leftcol;
@@ -847,10 +837,8 @@ splitwind_horiz(int f, int n)
 	/* share dot and mark with the original window */
 	wp->w_dotp = curwp->w_dotp;
 	wp->w_doto = curwp->w_doto;
-	wp->w_markp = curwp->w_markp;
-	wp->w_marko = curwp->w_marko;
 	wp->w_dotline = curwp->w_dotline;
-	wp->w_markline = curwp->w_markline;
+	mark_copy_from_window(wp, curwp);
 	wp->w_linep = curwp->w_linep;
 
 	/*
@@ -1405,11 +1393,8 @@ delwind(int f, int n)
 	if (--wp->w_bufp->b_nwnd == 0) {
 		wp->w_bufp->b_dotp = wp->w_dotp;
 		wp->w_bufp->b_doto = wp->w_doto;
-		wp->w_bufp->b_markp = wp->w_markp;
-		wp->w_bufp->b_marko = wp->w_marko;
-		wp->w_bufp->b_markp = wp->w_markp;
 		wp->w_bufp->b_dotline = wp->w_dotline;
-		wp->w_bufp->b_markline = wp->w_markline;
+		mark_save_to_buffer(wp, wp->w_bufp);
 	}
 
 	if (wp == wheadp) {

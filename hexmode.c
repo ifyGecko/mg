@@ -459,9 +459,8 @@ hex_install_layout(struct buffer *bp, const unsigned char *data, size_t len,
 		if (wp->w_bufp == bp) {
 			wp->w_dotp = bp->b_headp;
 			wp->w_doto = 0;
-			wp->w_markp = NULL;
-			wp->w_marko = 0;
 			wp->w_dotline = 1;
+			mark_clear_wp(wp);
 			wp->w_rflag |= WFFULL | WFMODE;
 		}
 	}
@@ -469,6 +468,8 @@ hex_install_layout(struct buffer *bp, const unsigned char *data, size_t len,
 	bp->b_doto = 0;
 	bp->b_markp = NULL;
 	bp->b_marko = 0;
+	bp->b_markline = 0;
+	bp->b_markactive = 0;
 	bp->b_dotline = 1;
 
 	if (undoable) {
@@ -548,8 +549,7 @@ hex_install_layout(struct buffer *bp, const unsigned char *data, size_t len,
 			wp->w_doto = HEX_FIRST_HEX_COL;
 			wp->w_dotline = 1;
 			wp->w_linep = first;
-			wp->w_markp = NULL;
-			wp->w_marko = 0;
+			mark_clear_wp(wp);
 			wp->w_rflag |= WFFULL | WFMODE;
 		}
 	}
@@ -642,8 +642,7 @@ hexmode_toggle(int f, int n)
 		wp->w_dotp = bfirstlp(bp);
 		wp->w_doto = 0;
 		wp->w_dotline = 1;
-		wp->w_markp = NULL;
-		wp->w_marko = 0;
+		mark_clear_wp(wp);
 		wp->w_linep = bfirstlp(bp);
 		wp->w_rflag |= WFFULL | WFMODE;
 		ewprintf("Exited hex-mode");

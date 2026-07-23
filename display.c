@@ -473,7 +473,7 @@ paint_region(struct mgwin *wp)
 	int		 sc_abs, ec_abs;
 	int		 llen_col;
 
-	if (wp->w_markp == NULL)
+	if (wp->w_markp == NULL || !wp->w_markactive)
 		return;
 
 	/* Empty region: nothing to highlight. */
@@ -643,11 +643,14 @@ update(int modelinecolor)
 		/*
 		 * Active region: in-line moves (backchar/forwchar/gotobol/
 		 * gotoeol) set no rflag, so dot can shift without us being
-		 * told. Force WFFULL whenever mark is set so reset_row_attr
-		 * clears stale attrs from cells that left the region before
-		 * paint_region re-stamps the current region.
+		 * told. Force WFFULL whenever the region highlight is active
+		 * so reset_row_attr clears stale attrs from cells that left
+		 * the region before paint_region re-stamps the current
+		 * region.  When the mark is only a bookmark (w_markactive
+		 * == 0) there is no highlight to maintain, so skip the
+		 * expensive full redraw.
 		 */
-		if (wp->w_markp != NULL)
+		if (wp->w_markp != NULL && wp->w_markactive)
 			wp->w_rflag |= WFFULL;
 
 		/*
@@ -813,7 +816,7 @@ update(int modelinecolor)
 	for (wp = wheadp; wp != NULL; wp = wp->w_wndp) {
 		int rmin, rmax;
 		paint_region(wp);
-		if (wp->w_markp == NULL)
+		if (wp->w_markp == NULL || !wp->w_markactive)
 			continue;
 		rmin = wp->w_toprow;
 		rmax = wp->w_toprow + wp->w_ntrows;
