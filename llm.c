@@ -1,17 +1,58 @@
 /* This file is in the public domain. */
 
 /*
- * LLM coding-assistant command.
+ * LLM commands.
  *
- *	M-x llm
- *		Pop up a *LLM Prompt* buffer and snapshot the source
- *		buffer's region (or dot position if no mark is set).
- *		The user composes a multi-line prompt in the compose
- *		buffer (no length cap, normal editing).  C-c C-c sends
- *		the prompt + saved context to a local OpenAI-compatible
- *		chat-completions endpoint via curl(1) and replaces the
- *		original region with the contents of the first fenced
- *		code block from the response.  C-c C-k aborts.
+ * Two independent facilities live in this file:
+ *
+ * 1. M-x llm  --  one-shot region/coding assistant.
+ *
+ *	Pop up a *LLM Prompt* buffer and snapshot the source
+ *	buffer's region (or dot position if no mark is set).
+ *	The user composes a multi-line prompt in the compose
+ *	buffer (no length cap, normal editing).  C-c C-c sends
+ *	the prompt + saved context to a local OpenAI-compatible
+ *	chat-completions endpoint via curl(1) and replaces the
+ *	original region with the contents of the first fenced
+ *	code block from the response.  C-c C-k aborts.
+ *
+ * 2. M-x llm-chat  --  interactive multi-turn chat.
+ *
+ *	Splits the current frame into a read-only *LLM Chat*
+ *	transcript on top and an editable *LLM Input* pane on
+ *	the bottom (~6 rows).  Type a prompt in the input pane
+ *	and press C-c C-c to send.  Full message history is
+ *	replayed to the server on every turn, so the model sees
+ *	the whole conversation without any manual pasting.
+ *
+ *	Slash commands drive session management, entered in the
+ *	input pane and dispatched by C-c C-c:
+ *
+ *	  /help              list slash commands
+ *	  /reset             clear history + transcript
+ *	  /compact           summarize history into a single
+ *	                     system note (blocking)
+ *	  /undo              drop last user+assistant turn
+ *	  /system <text>     set the system prompt (takes
+ *	                     effect on next /reset)
+ *	  /model             list models advertised by the
+ *	                     server's /v1/models endpoint
+ *	  /model <name>      switch model for this session
+ *	  /url <url>         switch endpoint for this session
+ *	  /save <path>       write transcript buffer to file
+ *	  /history           report message count and byte size
+ *	  /clear             clear transcript display only
+ *	  /quit              tear down both LLM buffers
+ *
+ *	A prompt whose first character is a literal '/' must be
+ *	written with a leading '//' to escape the dispatcher.
+ *
+ *	Additional input-pane keybindings:
+ *	  C-c C-c   send prompt (or dispatch slash command)
+ *	  C-c C-l   clear input pane
+ *	  C-c C-q   quit chat (== /quit)
+ *
+ * 3. Endpoint configuration (shared by both facilities):
  *
  *	M-x llm-set-url    "https://host:port/v1/chat/completions"
  *	M-x llm-set-model  "model-name"
@@ -26,12 +67,14 @@
 
 #include <sys/queue.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +85,10 @@
 #include "funmap.h"
 #include "macro.h"
 
-#define LLM_PROMPT_BUFNAME	"*LLM Prompt*"
+#define LLM_PROMPT_BUFNAME		"*LLM Prompt*"
+#define LLM_CHAT_BUFNAME		"*LLM Chat*"
+#define LLM_CHAT_INPUT_BUFNAME		"*LLM Input*"
+#define LLM_CHAT_INPUT_ROWS		6
 
 #define LLM_SYSTEM_PROMPT \
 	"You are a coding assistant embedded in a text editor. When asked " \
@@ -62,6 +108,11 @@
 	"Only output the resulting code in a single fenced code block " \
 	"(```language ... ```). Do not include explanations, preamble, or " \
 	"commentary. Comments inside the code are fine.\n"
+
+#define LLM_COMPACT_INSTRUCTION \
+	"Summarize the conversation above as a single compact system " \
+	"note. Preserve all decisions, code, constraints, and open " \
+	"questions. Output only the note, no preamble."
 
 static char	*llm_url = NULL;
 static char	*llm_model = NULL;
@@ -87,17 +138,102 @@ static struct {
 	int		 mark_offset;
 } llm_session;
 
-static int	 llm_set_str(char **, const char *);
-static char	*json_escape(const char *);
-static char	*json_extract_content(const char *);
-static char	*llm_strip_fences(char *);
-static int	 llm_pipe_curl(const char *, size_t, char **, size_t *);
-static int	 llm_query(const char *, const char *, size_t, int, char **);
-static int	 read_macro_arg(char *, size_t);
-static int	 llm_run(const char *);
-static char	*buffer_text(struct buffer *, size_t *);
+/*
+ * Multi-turn chat session state.  The message list is the source of
+ * truth for what goes on the wire; the visible transcript in log_bp
+ * is presentation only.  Single session -- second M-x llm-chat just
+ * re-focuses the input pane.
+ */
+struct llm_msg {
+	char		*role;		/* "system" | "user" | "assistant" */
+	char		*content;
+	struct llm_msg	*next;
+};
+
+static struct {
+	int		 active;
+	int		 busy;		/* re-entrancy guard around curl */
+	struct buffer	*log_bp;
+	struct buffer	*input_bp;
+	struct llm_msg	*history;	/* oldest first */
+	char		*system_prompt;	/* NULL == no system prompt */
+	char		*model_override;
+	char		*url_override;
+} llm_chat;
+
+static int		 llm_set_str(char **, const char *);
+static char		*json_escape(const char *);
+static int		 json_read_string(const char **, char **);
+static char		*json_extract_content(const char *);
+static int		 json_extract_model_ids(const char *, char ***,
+			     size_t *);
+static char		*llm_strip_fences(char *);
+static int		 llm_pipe_curl(const char *, const char *, size_t,
+			     char **, size_t *);
+static int		 llm_query(const char *, const char *, size_t, int,
+			     char **);
+static int		 read_macro_arg(char *, size_t);
+static int		 llm_run(const char *);
+static char		*buffer_text(struct buffer *, size_t *);
 static struct line	*lineno_to_lp(struct buffer *, int);
-static int	 buffer_in_list(struct buffer *);
+static int		 buffer_in_list(struct buffer *);
+
+static void		 chat_free_history(void);
+static int		 chat_push_msg(const char *, const char *, size_t);
+static int		 chat_pop_last_pair(void);
+static int		 chat_add_line(struct buffer *, const char *,
+			     size_t);
+static int		 chat_add_separator(struct buffer *);
+static int		 chat_append_block(struct buffer *, const char *,
+			     const char *, size_t);
+static void		 chat_scroll_bp_to_end(struct buffer *);
+static void		 chat_focus_input(void);
+static const char	*chat_effective_url(void);
+static const char	*chat_effective_model(void);
+static char		*chat_derive_models_url(const char *);
+static int		 chat_build_body(char **, size_t *,
+			     const char *, const char *);
+static int		 chat_send_history(char **);
+static int		 chat_render_history(void);
+static int		 chat_dispatch_slash(const char *);
+static int		 chat_layout(void);
+
+static int		 slash_help(const char *);
+static int		 slash_reset(const char *);
+static int		 slash_compact(const char *);
+static int		 slash_undo(const char *);
+static int		 slash_system(const char *);
+static int		 slash_model(const char *);
+static int		 slash_url(const char *);
+static int		 slash_save(const char *);
+static int		 slash_history_cmd(const char *);
+static int		 slash_clear(const char *);
+static int		 slash_quit(const char *);
+
+struct slash_cmd {
+	const char	*name;
+	int		 (*handler)(const char *);
+	const char	*help;
+};
+
+static const struct slash_cmd slash_cmds[] = {
+	{ "help",    slash_help,        "list slash commands" },
+	{ "reset",   slash_reset,       "clear history and transcript" },
+	{ "compact", slash_compact,
+	    "summarize history into a single system note" },
+	{ "undo",    slash_undo,        "drop last user+assistant turn" },
+	{ "system",  slash_system,
+	    "/system <text>  set system prompt (applies on next /reset)" },
+	{ "model",   slash_model,
+	    "/model          list server models\n"
+	    "                /model <name>   switch model" },
+	{ "url",     slash_url,         "/url <url>      switch endpoint" },
+	{ "save",    slash_save,        "/save <path>    write transcript" },
+	{ "history", slash_history_cmd, "report message count and size" },
+	{ "clear",   slash_clear,       "clear transcript display only" },
+	{ "quit",    slash_quit,        "tear down LLM buffers" },
+	{ NULL, NULL, NULL }
+};
 
 /*
  * Pull a single argument out of the interpreter's argument list.
@@ -219,38 +355,30 @@ json_escape(const char *in)
 }
 
 /*
- * Find choices[0].message.content in a JSON response and return its decoded
- * value as a malloc'd string.  Tolerant of whitespace; rejects on missing
- * key or unterminated string.
+ * Read a JSON string starting at *p (which must be pointing at the
+ * opening '"').  Advances *p past the closing '"' and returns a
+ * malloc'd decoded string via *out.  Returns TRUE on success, FALSE
+ * on malformed input or OOM.
  */
-static char *
-json_extract_content(const char *raw)
+static int
+json_read_string(const char **pp, char **out)
 {
-	const char	*p, *key = "\"content\"";
-	char		*out, *q;
+	const char	*p;
+	char		*buf, *q;
 	size_t		 cap;
 	unsigned int	 codepoint;
 	int		 i;
 
-	p = strstr(raw, key);
-	if (p == NULL)
-		return (NULL);
-	p += strlen(key);
-	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-		p++;
-	if (*p != ':')
-		return (NULL);
-	p++;
-	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-		p++;
+	*out = NULL;
+	p = *pp;
 	if (*p != '"')
-		return (NULL);
+		return (FALSE);
 	p++;
 
 	cap = strlen(p) + 1;
-	if ((out = malloc(cap)) == NULL)
-		return (NULL);
-	q = out;
+	if ((buf = malloc(cap)) == NULL)
+		return (FALSE);
+	q = buf;
 
 	while (*p != '\0' && *p != '"') {
 		if (*p != '\\') {
@@ -272,8 +400,8 @@ json_extract_content(const char *raw)
 			codepoint = 0;
 			for (i = 0; i < 4; i++) {
 				if (!isxdigit((unsigned char)p[i])) {
-					free(out);
-					return (NULL);
+					free(buf);
+					return (FALSE);
 				}
 				codepoint <<= 4;
 				if (p[i] >= '0' && p[i] <= '9')
@@ -284,8 +412,6 @@ json_extract_content(const char *raw)
 					codepoint |= p[i] - 'A' + 10;
 			}
 			p += 4;
-			/* Encode codepoint as UTF-8.  Surrogate pairs not
-			 * supported; emit replacement on lone surrogate. */
 			if (codepoint < 0x80) {
 				*q++ = (char)codepoint;
 			} else if (codepoint < 0x800) {
@@ -302,16 +428,145 @@ json_extract_content(const char *raw)
 			}
 			break;
 		default:
-			free(out);
-			return (NULL);
+			free(buf);
+			return (FALSE);
 		}
 	}
 	if (*p != '"') {
-		free(out);
-		return (NULL);
+		free(buf);
+		return (FALSE);
 	}
 	*q = '\0';
+	p++;
+	*pp = p;
+	*out = buf;
+	return (TRUE);
+}
+
+/*
+ * Find choices[0].message.content in a JSON response and return its decoded
+ * value as a malloc'd string.  Tolerant of whitespace; rejects on missing
+ * key or unterminated string.
+ */
+static char *
+json_extract_content(const char *raw)
+{
+	const char	*p, *key = "\"content\"";
+	char		*out = NULL;
+
+	p = strstr(raw, key);
+	if (p == NULL)
+		return (NULL);
+	p += strlen(key);
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (*p != ':')
+		return (NULL);
+	p++;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (json_read_string(&p, &out) != TRUE)
+		return (NULL);
 	return (out);
+}
+
+/*
+ * Extract every "id" string from the JSON models-list response
+ * (OpenAI shape: {"data":[{"id":"..."}, ...]}).  Returns TRUE on
+ * success with *ids as a malloc'd array of malloc'd strings and *n
+ * set to the count.  Returns FALSE if the shape can't be parsed.
+ */
+static int
+json_extract_model_ids(const char *raw, char ***ids, size_t *n)
+{
+	const char	*p, *end;
+	char		**arr = NULL, **narr;
+	size_t		 cap = 0, cnt = 0;
+	char		*val = NULL;
+	int		 depth;
+
+	*ids = NULL;
+	*n = 0;
+
+	p = strstr(raw, "\"data\"");
+	if (p == NULL)
+		return (FALSE);
+	p += strlen("\"data\"");
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (*p != ':')
+		return (FALSE);
+	p++;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (*p != '[')
+		return (FALSE);
+	p++;
+
+	/* find the matching ']' honoring nested brackets (crudely). */
+	depth = 1;
+	end = p;
+	while (*end != '\0' && depth > 0) {
+		if (*end == '"') {
+			/* skip a JSON string */
+			end++;
+			while (*end != '\0' && *end != '"') {
+				if (*end == '\\' && end[1] != '\0')
+					end += 2;
+				else
+					end++;
+			}
+			if (*end == '"')
+				end++;
+			continue;
+		}
+		if (*end == '[')
+			depth++;
+		else if (*end == ']')
+			depth--;
+		if (depth > 0)
+			end++;
+	}
+	if (depth != 0)
+		return (FALSE);
+
+	while (p < end) {
+		const char *k = strstr(p, "\"id\"");
+		if (k == NULL || k >= end)
+			break;
+		p = k + strlen("\"id\"");
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+			p++;
+		if (*p != ':')
+			continue;
+		p++;
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+			p++;
+		if (*p != '"')
+			continue;
+		if (json_read_string(&p, &val) != TRUE)
+			continue;
+		if (cnt + 1 > cap) {
+			cap = cap ? cap * 2 : 8;
+			if ((narr = reallocarray(arr, cap,
+			    sizeof(*arr))) == NULL) {
+				free(val);
+				goto oom;
+			}
+			arr = narr;
+		}
+		arr[cnt++] = val;
+		val = NULL;
+	}
+
+	*ids = arr;
+	*n = cnt;
+	return (TRUE);
+oom:
+	while (cnt > 0)
+		free(arr[--cnt]);
+	free(arr);
+	return (FALSE);
 }
 
 /*
@@ -348,13 +603,16 @@ llm_strip_fences(char *text)
 }
 
 /*
- * Fork curl(1) with stdout piped back to us.  Request body is staged in a
- * private tmpfile to avoid stdin-pipe deadlocks on large requests and to
- * keep payload off the argv list.  API key, if present, is passed via -H on
- * argv (visible via ps(1) -- acceptable for local-only endpoints).
+ * Fork curl(1) with stdout piped back to us.  If body != NULL, the
+ * request is a POST with the body staged in a private tmpfile (avoids
+ * stdin-pipe deadlocks on large requests and keeps payload off argv).
+ * If body == NULL, a bare GET is issued to url.  API key, if present,
+ * is passed via -H on argv (visible via ps(1) -- acceptable for
+ * local-only endpoints).
  */
 static int
-llm_pipe_curl(const char *body, size_t bodylen, char **out, size_t *outlen)
+llm_pipe_curl(const char *url, const char *body, size_t bodylen,
+    char **out, size_t *outlen)
 {
 	char		 tmpl[] = "/tmp/mg-llm-XXXXXX";
 	char		 auth[1024];
@@ -364,41 +622,52 @@ llm_pipe_curl(const char *body, size_t bodylen, char **out, size_t *outlen)
 	size_t		 resp_cap = 0, resp_len = 0;
 	ssize_t		 nw, nr;
 	size_t		 left;
-	int		 fd, p[2], argc, status;
+	int		 fd = -1, p[2], argc, status;
+	int		 have_body = (body != NULL);
 	pid_t		 pid;
 
 	*out = NULL;
 	*outlen = 0;
 
-	if ((fd = mkstemp(tmpl)) == -1) {
-		ewprintf("LLM: mkstemp: %s", strerror(errno));
+	if (url == NULL || url[0] == '\0') {
+		ewprintf("LLM: no URL configured");
 		return (FALSE);
 	}
-	(void)fchmod(fd, 0600);
-	left = bodylen;
-	while (left > 0) {
-		nw = write(fd, body + (bodylen - left), left);
-		if (nw <= 0) {
-			if (nw == -1 && errno == EINTR)
-				continue;
-			close(fd);
-			unlink(tmpl);
-			ewprintf("LLM: write tmp: %s", strerror(errno));
+
+	if (have_body) {
+		if ((fd = mkstemp(tmpl)) == -1) {
+			ewprintf("LLM: mkstemp: %s", strerror(errno));
 			return (FALSE);
 		}
-		left -= (size_t)nw;
+		(void)fchmod(fd, 0600);
+		left = bodylen;
+		while (left > 0) {
+			nw = write(fd, body + (bodylen - left), left);
+			if (nw <= 0) {
+				if (nw == -1 && errno == EINTR)
+					continue;
+				close(fd);
+				unlink(tmpl);
+				ewprintf("LLM: write tmp: %s",
+				    strerror(errno));
+				return (FALSE);
+			}
+			left -= (size_t)nw;
+		}
+		close(fd);
 	}
-	close(fd);
 
 	if (pipe(p) == -1) {
-		unlink(tmpl);
+		if (have_body)
+			unlink(tmpl);
 		ewprintf("LLM: pipe: %s", strerror(errno));
 		return (FALSE);
 	}
 
 	if ((pid = fork()) == -1) {
 		close(p[0]); close(p[1]);
-		unlink(tmpl);
+		if (have_body)
+			unlink(tmpl);
 		ewprintf("LLM: fork: %s", strerror(errno));
 		return (FALSE);
 	}
@@ -409,23 +678,27 @@ llm_pipe_curl(const char *body, size_t bodylen, char **out, size_t *outlen)
 		if (dup2(p[1], STDERR_FILENO) == -1) _exit(127);
 		close(p[1]);
 
-		snprintf(dataarg, sizeof(dataarg), "@%s", tmpl);
 		argc = 0;
 		argv[argc++] = "curl";
 		argv[argc++] = "-sS";
-		argv[argc++] = "-X";
-		argv[argc++] = "POST";
-		argv[argc++] = "-H";
-		argv[argc++] = "Content-Type: application/json";
 		if (llm_key != NULL && llm_key[0] != '\0') {
 			snprintf(auth, sizeof(auth),
 			    "Authorization: Bearer %s", llm_key);
 			argv[argc++] = "-H";
 			argv[argc++] = auth;
 		}
-		argv[argc++] = llm_url;
-		argv[argc++] = "--data-binary";
-		argv[argc++] = dataarg;
+		if (have_body) {
+			argv[argc++] = "-X";
+			argv[argc++] = "POST";
+			argv[argc++] = "-H";
+			argv[argc++] = "Content-Type: application/json";
+			argv[argc++] = (char *)url;
+			argv[argc++] = "--data-binary";
+			snprintf(dataarg, sizeof(dataarg), "@%s", tmpl);
+			argv[argc++] = dataarg;
+		} else {
+			argv[argc++] = (char *)url;
+		}
 		argv[argc] = NULL;
 
 		execvp("curl", argv);
@@ -455,7 +728,8 @@ llm_pipe_curl(const char *body, size_t bodylen, char **out, size_t *outlen)
 				free(resp);
 				close(p[0]);
 				waitpid(pid, NULL, 0);
-				unlink(tmpl);
+				if (have_body)
+					unlink(tmpl);
 				ewprintf("LLM: out of memory");
 				return (FALSE);
 			}
@@ -467,7 +741,8 @@ llm_pipe_curl(const char *body, size_t bodylen, char **out, size_t *outlen)
 	}
 	close(p[0]);
 	waitpid(pid, &status, 0);
-	unlink(tmpl);
+	if (have_body)
+		unlink(tmpl);
 
 	if (resp == NULL) {
 		if ((resp = malloc(1)) == NULL) {
@@ -558,7 +833,7 @@ llm_query(const char *user_instr, const char *ctx, size_t ctxlen,
 	}
 	body_len = (size_t)n;
 
-	if (llm_pipe_curl(body, body_len, &raw, &raw_len) != TRUE)
+	if (llm_pipe_curl(llm_url, body, body_len, &raw, &raw_len) != TRUE)
 		goto done;
 
 	if ((content = json_extract_content(raw)) == NULL) {
@@ -1014,6 +1289,1225 @@ llm_compose_abort(int f, int n)
 	return (TRUE);
 }
 
+/* ------------------------------------------------------------------- */
+/* M-x llm-chat -- interactive multi-turn chat session                  */
+/* ------------------------------------------------------------------- */
+
+/*
+ * Free every message in the history list.  Idempotent.
+ */
+static void
+chat_free_history(void)
+{
+	struct llm_msg	*m, *nx;
+
+	m = llm_chat.history;
+	while (m != NULL) {
+		nx = m->next;
+		free(m->role);
+		free(m->content);
+		free(m);
+		m = nx;
+	}
+	llm_chat.history = NULL;
+}
+
+/*
+ * Append a message to the history list.  content_len is the byte count
+ * of content; the caller doesn't need to NUL-terminate.
+ */
+static int
+chat_push_msg(const char *role, const char *content, size_t content_len)
+{
+	struct llm_msg	*m, *tail;
+
+	if ((m = calloc(1, sizeof(*m))) == NULL)
+		return (FALSE);
+	if ((m->role = strdup(role)) == NULL) {
+		free(m);
+		return (FALSE);
+	}
+	if ((m->content = malloc(content_len + 1)) == NULL) {
+		free(m->role);
+		free(m);
+		return (FALSE);
+	}
+	if (content_len > 0)
+		memcpy(m->content, content, content_len);
+	m->content[content_len] = '\0';
+
+	if (llm_chat.history == NULL) {
+		llm_chat.history = m;
+	} else {
+		for (tail = llm_chat.history; tail->next != NULL;
+		    tail = tail->next)
+			;
+		tail->next = m;
+	}
+	return (TRUE);
+}
+
+/*
+ * Drop the trailing {user, assistant} pair from history.  Returns TRUE
+ * if a pair was removed, FALSE otherwise.
+ */
+static int
+chat_pop_last_pair(void)
+{
+	struct llm_msg	*cur, *prev, *last, *penult;
+
+	last = NULL;
+	penult = NULL;
+	for (cur = llm_chat.history; cur != NULL; cur = cur->next) {
+		penult = last;
+		last = cur;
+	}
+	if (last == NULL || penult == NULL)
+		return (FALSE);
+	if (strcmp(last->role, "assistant") != 0 ||
+	    strcmp(penult->role, "user") != 0)
+		return (FALSE);
+
+	prev = NULL;
+	for (cur = llm_chat.history; cur != penult; cur = cur->next)
+		prev = cur;
+
+	if (prev == NULL)
+		llm_chat.history = NULL;
+	else
+		prev->next = NULL;
+
+	free(penult->role); free(penult->content); free(penult);
+	free(last->role); free(last->content); free(last);
+	return (TRUE);
+}
+
+/*
+ * Append a raw line (no embedded newlines) to bp.  Bypasses linsert()
+ * so it works transparently on BFREADONLY buffers, mirroring
+ * addlinef() in buffer.c.
+ */
+static int
+chat_add_line(struct buffer *bp, const char *s, size_t len)
+{
+	struct line	*lp;
+
+	if ((lp = lalloc((int)len)) == NULL)
+		return (FALSE);
+	if (len > 0)
+		memcpy(lp->l_text, s, len);
+	lp->l_used = (int)len;
+
+	bp->b_headp->l_bp->l_fp = lp;
+	lp->l_bp = bp->b_headp->l_bp;
+	bp->b_headp->l_bp = lp;
+	lp->l_fp = bp->b_headp;
+	bp->b_lines++;
+	return (TRUE);
+}
+
+/*
+ * Emit three lines of '#' spanning the current frame width, as a
+ * visual delimiter between chat blocks.
+ */
+static int
+chat_add_separator(struct buffer *bp)
+{
+	char	buf[512];
+	size_t	w;
+	int	i;
+
+	w = (ncol > 0) ? (size_t)ncol : 40;
+	if (w > sizeof(buf))
+		w = sizeof(buf);
+	memset(buf, '#', w);
+	for (i = 0; i < 3; i++) {
+		if (chat_add_line(bp, buf, w) != TRUE)
+			return (FALSE);
+	}
+	return (TRUE);
+}
+
+/*
+ * Append a labelled block to bp:  "<prefix> <first_line>\n<continuation>\n..."
+ * with a hash-line separator at the end.  Handles embedded newlines in text.
+ */
+static int
+chat_append_block(struct buffer *bp, const char *prefix,
+    const char *text, size_t len)
+{
+	size_t		 i, start;
+	int		 first = TRUE;
+	char		 head[128];
+	size_t		 plen;
+	char		*buf = NULL;
+	size_t		 buflen;
+
+	plen = snprintf(head, sizeof(head), "%s ", prefix);
+	if (plen >= sizeof(head))
+		plen = sizeof(head) - 1;
+
+	start = 0;
+	for (i = 0; i <= len; i++) {
+		if (i == len || text[i] == '\n') {
+			size_t seg = i - start;
+			if (first) {
+				buflen = plen + seg;
+				if ((buf = malloc(buflen ? buflen : 1))
+				    == NULL)
+					return (FALSE);
+				memcpy(buf, head, plen);
+				if (seg > 0)
+					memcpy(buf + plen,
+					    text + start, seg);
+				if (chat_add_line(bp, buf, buflen) != TRUE) {
+					free(buf);
+					return (FALSE);
+				}
+				free(buf);
+				first = FALSE;
+			} else {
+				if (chat_add_line(bp, text + start,
+				    seg) != TRUE)
+					return (FALSE);
+			}
+			start = i + 1;
+			if (i == len)
+				break;
+		}
+	}
+	if (chat_add_separator(bp) != TRUE)
+		return (FALSE);
+	return (TRUE);
+}
+
+/*
+ * For every window currently displaying bp, advance dot to the end of
+ * the buffer and flag a full redraw so newly appended content is
+ * visible.
+ */
+static void
+chat_scroll_bp_to_end(struct buffer *bp)
+{
+	struct mgwin	*wp;
+	struct line	*last = blastlp(bp);
+
+	bp->b_dotp = last;
+	bp->b_doto = llength(last);
+	bp->b_dotline = bp->b_lines;
+
+	for (wp = wheadp; wp != NULL; wp = wp->w_wndp) {
+		if (wp->w_bufp != bp)
+			continue;
+		wp->w_dotp = last;
+		wp->w_doto = llength(last);
+		wp->w_dotline = bp->b_lines;
+		wp->w_rflag |= WFFULL | WFMOVE;
+	}
+}
+
+/*
+ * Move focus to the input pane if it exists, and re-anchor every
+ * window showing input_bp so its w_linep/w_dotp/w_markp point at
+ * currently-valid lines (bclear frees the old ones).  Falls back to
+ * no-op if input_bp is not shown anywhere.
+ */
+static void
+chat_focus_input(void)
+{
+	struct mgwin	*wp;
+	struct buffer	*bp;
+	struct line	*last;
+
+	if (llm_chat.input_bp == NULL)
+		return;
+	bp = llm_chat.input_bp;
+	last = blastlp(bp);
+	bp->b_dotp = last;
+	bp->b_doto = llength(last);
+	bp->b_dotline = bp->b_lines;
+	bp->b_markp = NULL;
+	bp->b_marko = 0;
+	bp->b_markactive = 0;
+
+	for (wp = wheadp; wp != NULL; wp = wp->w_wndp) {
+		if (wp->w_bufp != bp)
+			continue;
+		wp->w_dotp = last;
+		wp->w_doto = llength(last);
+		wp->w_dotline = bp->b_lines;
+		wp->w_linep = bfirstlp(bp);
+		wp->w_markp = NULL;
+		wp->w_marko = 0;
+		wp->w_markline = 0;
+		wp->w_markactive = 0;
+		wp->w_rflag |= WFFULL | WFMOVE | WFMODE;
+		if (curwp != wp && wp->w_bufp == llm_chat.input_bp) {
+			curwp = wp;
+			curbp = bp;
+		}
+	}
+}
+
+static const char *
+chat_effective_url(void)
+{
+	if (llm_chat.url_override != NULL && llm_chat.url_override[0] != '\0')
+		return (llm_chat.url_override);
+	return (llm_url);
+}
+
+static const char *
+chat_effective_model(void)
+{
+	if (llm_chat.model_override != NULL &&
+	    llm_chat.model_override[0] != '\0')
+		return (llm_chat.model_override);
+	return (llm_model);
+}
+
+/*
+ * Turn a chat-completions URL like
+ *    http://host/v1/chat/completions
+ * into the corresponding models URL:
+ *    http://host/v1/models
+ * Fallback: replace everything after the last '/' with "models".
+ * Returns a malloc'd string, or NULL on failure.
+ */
+static char *
+chat_derive_models_url(const char *chat_url)
+{
+	const char	*suffix = "/chat/completions";
+	size_t		 sfxlen = strlen(suffix);
+	size_t		 ulen;
+	const char	*slash;
+	char		*out;
+	size_t		 pfx;
+
+	if (chat_url == NULL || chat_url[0] == '\0')
+		return (NULL);
+	ulen = strlen(chat_url);
+	if (ulen > sfxlen && strcmp(chat_url + ulen - sfxlen, suffix) == 0) {
+		pfx = ulen - sfxlen;
+		if ((out = malloc(pfx + strlen("/models") + 1)) == NULL)
+			return (NULL);
+		memcpy(out, chat_url, pfx);
+		memcpy(out + pfx, "/models", strlen("/models") + 1);
+		return (out);
+	}
+	slash = strrchr(chat_url, '/');
+	if (slash == NULL)
+		return (NULL);
+	pfx = (size_t)(slash - chat_url) + 1;
+	if ((out = malloc(pfx + strlen("models") + 1)) == NULL)
+		return (NULL);
+	memcpy(out, chat_url, pfx);
+	memcpy(out + pfx, "models", strlen("models") + 1);
+	return (out);
+}
+
+/*
+ * Serialize llm_chat.history (optionally with the session's system
+ * prompt prepended if not already present, and optionally with one
+ * synthetic user message appended for /compact) into a JSON body.
+ * Returns TRUE on success with body/bodylen owned by the caller.
+ */
+static int
+chat_build_body(char **body, size_t *bodylen,
+    const char *extra_role, const char *extra_content)
+{
+	char		*model_esc = NULL;
+	struct llm_msg	*m;
+	char		*buf = NULL;
+	size_t		 cap = 4096, len = 0;
+	const char	*model;
+	int		 first = TRUE;
+	int		 need_leading_system;
+
+	*body = NULL;
+	*bodylen = 0;
+
+	model = chat_effective_model();
+	if (model == NULL || model[0] == '\0') {
+		ewprintf("LLM: no model configured");
+		return (FALSE);
+	}
+	if ((model_esc = json_escape(model)) == NULL) {
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+
+	if ((buf = malloc(cap)) == NULL) {
+		free(model_esc);
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+
+#define APPEND(str, slen)						\
+	do {								\
+		size_t _l = (slen);					\
+		while (len + _l + 1 > cap) {				\
+			size_t _n = cap * 2;				\
+			char *_p = realloc(buf, _n);			\
+			if (_p == NULL) { free(buf); free(model_esc);	\
+			    ewprintf("LLM: out of memory");		\
+			    return (FALSE); }				\
+			buf = _p; cap = _n;				\
+		}							\
+		memcpy(buf + len, (str), _l);				\
+		len += _l;						\
+	} while (0)
+
+#define APPEND_S(s) APPEND((s), strlen(s))
+
+	APPEND_S("{\"model\":\"");
+	APPEND_S(model_esc);
+	APPEND_S("\",\"stream\":false,\"messages\":[");
+
+	need_leading_system = (llm_chat.system_prompt != NULL &&
+	    llm_chat.system_prompt[0] != '\0');
+	if (need_leading_system && llm_chat.history != NULL &&
+	    strcmp(llm_chat.history->role, "system") == 0)
+		need_leading_system = 0;
+
+	if (need_leading_system) {
+		char *sys_esc = json_escape(llm_chat.system_prompt);
+		if (sys_esc == NULL) {
+			free(buf); free(model_esc);
+			ewprintf("LLM: out of memory");
+			return (FALSE);
+		}
+		APPEND_S("{\"role\":\"system\",\"content\":\"");
+		APPEND_S(sys_esc);
+		APPEND_S("\"}");
+		free(sys_esc);
+		first = FALSE;
+	}
+
+	for (m = llm_chat.history; m != NULL; m = m->next) {
+		char *role_esc = json_escape(m->role);
+		char *content_esc = json_escape(m->content);
+		if (role_esc == NULL || content_esc == NULL) {
+			free(role_esc); free(content_esc);
+			free(buf); free(model_esc);
+			ewprintf("LLM: out of memory");
+			return (FALSE);
+		}
+		if (!first)
+			APPEND_S(",");
+		APPEND_S("{\"role\":\"");
+		APPEND_S(role_esc);
+		APPEND_S("\",\"content\":\"");
+		APPEND_S(content_esc);
+		APPEND_S("\"}");
+		free(role_esc);
+		free(content_esc);
+		first = FALSE;
+	}
+
+	if (extra_role != NULL && extra_content != NULL) {
+		char *r = json_escape(extra_role);
+		char *c = json_escape(extra_content);
+		if (r == NULL || c == NULL) {
+			free(r); free(c);
+			free(buf); free(model_esc);
+			ewprintf("LLM: out of memory");
+			return (FALSE);
+		}
+		if (!first)
+			APPEND_S(",");
+		APPEND_S("{\"role\":\"");
+		APPEND_S(r);
+		APPEND_S("\",\"content\":\"");
+		APPEND_S(c);
+		APPEND_S("\"}");
+		free(r);
+		free(c);
+	}
+
+	APPEND_S("]}");
+	buf[len] = '\0';
+
+#undef APPEND
+#undef APPEND_S
+
+	free(model_esc);
+	*body = buf;
+	*bodylen = len;
+	return (TRUE);
+}
+
+/*
+ * Send the current history to the endpoint and place the extracted
+ * assistant reply in *reply (malloc'd).  Does NOT mutate history.
+ */
+static int
+chat_send_history(char **reply)
+{
+	char		*body = NULL, *raw = NULL, *content = NULL;
+	size_t		 bodylen, rawlen;
+	const char	*url = chat_effective_url();
+
+	*reply = NULL;
+
+	if (url == NULL || url[0] == '\0') {
+		ewprintf("LLM: not configured; use llm-set-url");
+		return (FALSE);
+	}
+	if (chat_build_body(&body, &bodylen, NULL, NULL) != TRUE)
+		return (FALSE);
+	if (llm_pipe_curl(url, body, bodylen, &raw, &rawlen) != TRUE) {
+		free(body);
+		return (FALSE);
+	}
+	free(body);
+	if ((content = json_extract_content(raw)) == NULL) {
+		free(raw);
+		ewprintf("LLM: malformed response (no content field)");
+		return (FALSE);
+	}
+	free(raw);
+	*reply = content;
+	return (TRUE);
+}
+
+/*
+ * Rewrite the entire chat log buffer from llm_chat.history.
+ */
+static int
+chat_render_history(void)
+{
+	struct llm_msg	*m;
+	struct buffer	*bp = llm_chat.log_bp;
+	int		 saved_ro;
+
+	if (bp == NULL)
+		return (FALSE);
+	saved_ro = bp->b_flag & BFREADONLY;
+	bp->b_flag &= ~BFREADONLY;
+	if (bclear(bp) != TRUE) {
+		if (saved_ro)
+			bp->b_flag |= BFREADONLY;
+		return (FALSE);
+	}
+	if (saved_ro)
+		bp->b_flag |= BFREADONLY;
+
+	if (chat_add_line(bp,
+	    "-- *LLM Chat* -- /help for slash commands --", 44) != TRUE)
+		return (FALSE);
+	if (chat_add_separator(bp) != TRUE)
+		return (FALSE);
+
+	for (m = llm_chat.history; m != NULL; m = m->next) {
+		const char *prefix;
+		if (strcmp(m->role, "user") == 0)
+			prefix = "mg>";
+		else if (strcmp(m->role, "assistant") == 0)
+			prefix = "llm>";
+		else
+			prefix = "sys>";
+		if (chat_append_block(bp, prefix, m->content,
+		    strlen(m->content)) != TRUE)
+			return (FALSE);
+	}
+	chat_scroll_bp_to_end(bp);
+	return (TRUE);
+}
+
+/* -------- slash commands -------- */
+
+static int
+slash_help(const char *args)
+{
+	struct buffer		*bp = llm_chat.log_bp;
+	const struct slash_cmd	*c;
+	char			 line[256];
+	int			 n;
+
+	if (bp == NULL)
+		return (FALSE);
+	if (chat_add_line(bp, "sys> slash commands:", 20) != TRUE)
+		return (FALSE);
+	for (c = slash_cmds; c->name != NULL; c++) {
+		n = snprintf(line, sizeof(line), "     /%-8s  %s",
+		    c->name, c->help ? c->help : "");
+		if (n < 0)
+			return (FALSE);
+		if ((size_t)n >= sizeof(line))
+			n = (int)sizeof(line) - 1;
+		if (chat_add_line(bp, line, (size_t)n) != TRUE)
+			return (FALSE);
+	}
+	if (chat_add_line(bp,
+	    "     (prepend a literal '/' with '//' to send it as text)",
+	    56) != TRUE)
+		return (FALSE);
+	if (chat_add_separator(bp) != TRUE)
+		return (FALSE);
+	chat_scroll_bp_to_end(bp);
+	return (TRUE);
+}
+
+static int
+slash_reset(const char *args)
+{
+	chat_free_history();
+	if (llm_chat.system_prompt != NULL &&
+	    llm_chat.system_prompt[0] != '\0') {
+		(void)chat_push_msg("system", llm_chat.system_prompt,
+		    strlen(llm_chat.system_prompt));
+	}
+	if (chat_render_history() != TRUE)
+		return (FALSE);
+	ewprintf("LLM: session reset");
+	return (TRUE);
+}
+
+static int
+slash_compact(const char *args)
+{
+	char	*body = NULL, *raw = NULL, *summary = NULL;
+	size_t	 bodylen, rawlen;
+	const char *url = chat_effective_url();
+
+	if (llm_chat.history == NULL) {
+		ewprintf("LLM: nothing to compact");
+		return (FALSE);
+	}
+	if (url == NULL || url[0] == '\0') {
+		ewprintf("LLM: no URL configured");
+		return (FALSE);
+	}
+	ewprintf("LLM: compacting...");
+	update(CMODE);
+	if (chat_build_body(&body, &bodylen, "user",
+	    LLM_COMPACT_INSTRUCTION) != TRUE)
+		return (FALSE);
+	if (llm_pipe_curl(url, body, bodylen, &raw, &rawlen) != TRUE) {
+		free(body);
+		return (FALSE);
+	}
+	free(body);
+	if ((summary = json_extract_content(raw)) == NULL) {
+		free(raw);
+		ewprintf("LLM: malformed response");
+		return (FALSE);
+	}
+	free(raw);
+
+	chat_free_history();
+	if (chat_push_msg("system", summary, strlen(summary)) != TRUE) {
+		free(summary);
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	free(summary);
+	if (chat_render_history() != TRUE)
+		return (FALSE);
+	ewprintf("LLM: history compacted");
+	return (TRUE);
+}
+
+static int
+slash_undo(const char *args)
+{
+	if (chat_pop_last_pair() != TRUE) {
+		dobeep();
+		ewprintf("LLM: nothing to undo");
+		return (FALSE);
+	}
+	if (chat_render_history() != TRUE)
+		return (FALSE);
+	ewprintf("LLM: last turn removed");
+	return (TRUE);
+}
+
+static int
+slash_system(const char *args)
+{
+	char	*copy;
+
+	if (args == NULL || args[0] == '\0') {
+		free(llm_chat.system_prompt);
+		llm_chat.system_prompt = NULL;
+		ewprintf("LLM: system prompt cleared (applies on /reset)");
+		return (TRUE);
+	}
+	if ((copy = strdup(args)) == NULL) {
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	free(llm_chat.system_prompt);
+	llm_chat.system_prompt = copy;
+	ewprintf("LLM: system prompt set (applies on /reset)");
+	return (TRUE);
+}
+
+static int
+slash_model(const char *args)
+{
+	char		*murl = NULL, *raw = NULL, **ids = NULL;
+	size_t		 rawlen, n, i;
+	struct buffer	*bp = llm_chat.log_bp;
+	const char	*current, *url;
+	int		 ret = FALSE;
+	char		 line[256];
+	int		 wrote;
+
+	if (args != NULL && args[0] != '\0') {
+		char *copy = strdup(args);
+		if (copy == NULL) {
+			ewprintf("LLM: out of memory");
+			return (FALSE);
+		}
+		free(llm_chat.model_override);
+		llm_chat.model_override = copy;
+		ewprintf("LLM: model set to '%s'", copy);
+		return (TRUE);
+	}
+
+	url = chat_effective_url();
+	if (url == NULL || url[0] == '\0') {
+		ewprintf("LLM: no URL configured");
+		return (FALSE);
+	}
+	if ((murl = chat_derive_models_url(url)) == NULL) {
+		ewprintf("LLM: cannot derive models URL");
+		return (FALSE);
+	}
+	ewprintf("LLM: fetching models...");
+	update(CMODE);
+	if (llm_pipe_curl(murl, NULL, 0, &raw, &rawlen) != TRUE) {
+		free(murl);
+		return (FALSE);
+	}
+
+	if (bp == NULL) {
+		free(murl); free(raw);
+		return (FALSE);
+	}
+
+	if (json_extract_model_ids(raw, &ids, &n) != TRUE || n == 0) {
+		wrote = snprintf(line, sizeof(line),
+		    "sys> models: cannot parse response from %s", murl);
+		if (wrote < 0) wrote = 0;
+		if ((size_t)wrote >= sizeof(line))
+			wrote = (int)sizeof(line) - 1;
+		chat_add_line(bp, line, (size_t)wrote);
+		if (rawlen > 0)
+			chat_append_block(bp, "sys>", raw, rawlen);
+		chat_scroll_bp_to_end(bp);
+		free(murl); free(raw);
+		return (FALSE);
+	}
+
+	current = chat_effective_model();
+	wrote = snprintf(line, sizeof(line), "sys> models available at %s:",
+	    murl);
+	if (wrote < 0) wrote = 0;
+	if ((size_t)wrote >= sizeof(line)) wrote = (int)sizeof(line) - 1;
+	chat_add_line(bp, line, (size_t)wrote);
+	for (i = 0; i < n; i++) {
+		const char *mark = (current != NULL &&
+		    strcmp(current, ids[i]) == 0) ? "*" : " ";
+		wrote = snprintf(line, sizeof(line), "     %s %s", mark,
+		    ids[i]);
+		if (wrote < 0) wrote = 0;
+		if ((size_t)wrote >= sizeof(line))
+			wrote = (int)sizeof(line) - 1;
+		chat_add_line(bp, line, (size_t)wrote);
+	}
+	chat_add_separator(bp);
+	chat_scroll_bp_to_end(bp);
+	ret = TRUE;
+
+	for (i = 0; i < n; i++)
+		free(ids[i]);
+	free(ids);
+	free(murl);
+	free(raw);
+	return (ret);
+}
+
+static int
+slash_url(const char *args)
+{
+	char	*copy;
+
+	if (args == NULL || args[0] == '\0') {
+		ewprintf("LLM: /url requires a URL");
+		return (FALSE);
+	}
+	if ((copy = strdup(args)) == NULL) {
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	free(llm_chat.url_override);
+	llm_chat.url_override = copy;
+	ewprintf("LLM: endpoint set to '%s'", copy);
+	return (TRUE);
+}
+
+static int
+slash_save(const char *args)
+{
+	char	*text;
+	size_t	 len;
+	int	 fd;
+	ssize_t	 nw;
+	size_t	 left;
+
+	if (args == NULL || args[0] == '\0') {
+		ewprintf("LLM: /save requires a path");
+		return (FALSE);
+	}
+	if (llm_chat.log_bp == NULL)
+		return (FALSE);
+	if ((text = buffer_text(llm_chat.log_bp, &len)) == NULL) {
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	fd = open(args, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd == -1) {
+		free(text);
+		ewprintf("LLM: open %s: %s", args, strerror(errno));
+		return (FALSE);
+	}
+	left = len;
+	while (left > 0) {
+		nw = write(fd, text + (len - left), left);
+		if (nw <= 0) {
+			if (nw == -1 && errno == EINTR)
+				continue;
+			close(fd);
+			free(text);
+			ewprintf("LLM: write %s: %s", args, strerror(errno));
+			return (FALSE);
+		}
+		left -= (size_t)nw;
+	}
+	close(fd);
+	free(text);
+	ewprintf("LLM: wrote %zu bytes to %s", len, args);
+	return (TRUE);
+}
+
+static int
+slash_history_cmd(const char *args)
+{
+	struct llm_msg	*m;
+	size_t		 count = 0, bytes = 0;
+
+	for (m = llm_chat.history; m != NULL; m = m->next) {
+		count++;
+		bytes += strlen(m->content);
+	}
+	ewprintf("LLM: %zu message%s, %zu content bytes",
+	    count, count == 1 ? "" : "s", bytes);
+	return (TRUE);
+}
+
+static int
+slash_clear(const char *args)
+{
+	struct buffer	*bp = llm_chat.log_bp;
+	int		 saved_ro;
+
+	if (bp == NULL)
+		return (FALSE);
+	saved_ro = bp->b_flag & BFREADONLY;
+	bp->b_flag &= ~BFREADONLY;
+	if (bclear(bp) != TRUE) {
+		if (saved_ro)
+			bp->b_flag |= BFREADONLY;
+		return (FALSE);
+	}
+	if (saved_ro)
+		bp->b_flag |= BFREADONLY;
+	chat_add_line(bp,
+	    "-- *LLM Chat* -- transcript cleared (history preserved) --",
+	    58);
+	chat_add_separator(bp);
+	chat_scroll_bp_to_end(bp);
+	ewprintf("LLM: transcript cleared");
+	return (TRUE);
+}
+
+static int
+slash_quit(const char *args)
+{
+	struct buffer	*log_bp = llm_chat.log_bp;
+	struct buffer	*input_bp = llm_chat.input_bp;
+
+	chat_free_history();
+	free(llm_chat.system_prompt);
+	free(llm_chat.model_override);
+	free(llm_chat.url_override);
+	llm_chat.system_prompt = NULL;
+	llm_chat.model_override = NULL;
+	llm_chat.url_override = NULL;
+	llm_chat.log_bp = NULL;
+	llm_chat.input_bp = NULL;
+	llm_chat.active = FALSE;
+	llm_chat.busy = FALSE;
+
+	/* Focus somewhere sane before killing buffers. */
+	if (curbp == input_bp || curbp == log_bp) {
+		struct buffer	*fallback = NULL;
+		struct buffer	*b;
+		for (b = bheadp; b != NULL; b = b->b_bufp) {
+			if (b != log_bp && b != input_bp &&
+			    b->b_bname[0] != '*') {
+				fallback = b;
+				break;
+			}
+		}
+		if (fallback == NULL) {
+			for (b = bheadp; b != NULL; b = b->b_bufp) {
+				if (b != log_bp && b != input_bp) {
+					fallback = b;
+					break;
+				}
+			}
+		}
+		if (fallback != NULL) {
+			(void)showbuffer(fallback, curwp,
+			    WFFULL | WFFRAME | WFMODE);
+			curbp = fallback;
+		}
+	}
+
+	if (input_bp != NULL && buffer_in_list(input_bp))
+		(void)killbuffer(input_bp);
+	if (log_bp != NULL && buffer_in_list(log_bp))
+		(void)killbuffer(log_bp);
+	(void)onlywind(FFRAND, 1);
+
+	ewprintf("LLM: chat session ended");
+	return (TRUE);
+}
+
+/*
+ * Parse and dispatch a slash-command line.  raw points at the first
+ * '/' of the input.  Returns TRUE on any dispatch attempt (success or
+ * clean failure); FALSE only on structural error.
+ */
+static int
+chat_dispatch_slash(const char *raw)
+{
+	const char		*p, *args;
+	char			 name[32];
+	size_t			 nlen;
+	const struct slash_cmd	*c;
+
+	if (raw == NULL || raw[0] != '/')
+		return (FALSE);
+	p = raw + 1;
+	nlen = 0;
+	while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' &&
+	    nlen + 1 < sizeof(name)) {
+		name[nlen++] = *p++;
+	}
+	name[nlen] = '\0';
+	while (*p == ' ' || *p == '\t')
+		p++;
+	args = p;
+	/* Strip trailing whitespace from args (in a local copy). */
+	if (*args != '\0') {
+		size_t	alen = strlen(args);
+		while (alen > 0 && (args[alen - 1] == ' ' ||
+		    args[alen - 1] == '\t' || args[alen - 1] == '\n' ||
+		    args[alen - 1] == '\r'))
+			alen--;
+		char *acopy = malloc(alen + 1);
+		if (acopy == NULL) {
+			ewprintf("LLM: out of memory");
+			return (FALSE);
+		}
+		memcpy(acopy, args, alen);
+		acopy[alen] = '\0';
+		for (c = slash_cmds; c->name != NULL; c++) {
+			if (strcmp(c->name, name) == 0) {
+				int rc = c->handler(acopy);
+				free(acopy);
+				return (rc);
+			}
+		}
+		free(acopy);
+	} else {
+		for (c = slash_cmds; c->name != NULL; c++) {
+			if (strcmp(c->name, name) == 0)
+				return (c->handler(""));
+		}
+	}
+	dobeep();
+	ewprintf("LLM: unknown command /%s (try /help)", name);
+	return (FALSE);
+}
+
+/*
+ * Split the current window and lay out log_bp on top, input_bp on the
+ * bottom sized to LLM_CHAT_INPUT_ROWS.  Assumes both buffers exist.
+ */
+static int
+chat_layout(void)
+{
+	struct mgwin	*upper;
+	int		 target = LLM_CHAT_INPUT_ROWS;
+	int		 delta;
+
+	if (onlywind(FFRAND, 1) != TRUE)
+		return (FALSE);
+	if (showbuffer(llm_chat.log_bp, curwp,
+	    WFFULL | WFFRAME | WFMODE) != TRUE)
+		return (FALSE);
+	curbp = llm_chat.log_bp;
+	curwp->w_dotp = blastlp(curbp);
+	curwp->w_doto = llength(curwp->w_dotp);
+	curwp->w_dotline = curbp->b_lines;
+	curwp->w_linep = bfirstlp(curbp);
+
+	upper = curwp;
+	if (splitwind(FFRAND, 1) != TRUE)
+		return (FALSE);
+	/* After splitwind, curwp is still the upper window; move to lower. */
+	if (nextwind(FFRAND, 1) != TRUE)
+		return (FALSE);
+	if (curwp == upper) {
+		/* only one window remained -- split failed silently */
+		return (FALSE);
+	}
+	if (showbuffer(llm_chat.input_bp, curwp,
+	    WFFULL | WFFRAME | WFMODE) != TRUE)
+		return (FALSE);
+	curbp = llm_chat.input_bp;
+	curwp->w_dotp = bfirstlp(curbp);
+	curwp->w_doto = 0;
+	curwp->w_dotline = 1;
+	curwp->w_linep = curwp->w_dotp;
+	mark_clear_wp(curwp);
+
+	/* Resize input pane toward target rows. */
+	delta = curwp->w_ntrows - target;
+	if (delta > 0)
+		(void)shrinkwind(FFRAND, delta);
+	else if (delta < 0)
+		(void)enlargewind(FFRAND, -delta);
+
+	return (TRUE);
+}
+
+/*
+ * M-x llm-chat  --  open (or re-focus) the interactive chat session.
+ */
+int
+llm_chat_cmd(int f, int n)
+{
+	struct maps_s	*chat_mode;
+	int		 fresh;
+
+	if (chat_effective_url() == NULL || chat_effective_url()[0] == '\0' ||
+	    chat_effective_model() == NULL ||
+	    chat_effective_model()[0] == '\0') {
+		if (llm_url == NULL || llm_url[0] == '\0' ||
+		    llm_model == NULL || llm_model[0] == '\0') {
+			dobeep();
+			ewprintf("LLM: not configured; "
+			    "use llm-set-url and llm-set-model");
+			return (FALSE);
+		}
+	}
+
+	if ((chat_mode = name_mode("llm-chat")) == NULL) {
+		dobeep();
+		ewprintf("LLM: llm-chat mode not registered");
+		return (FALSE);
+	}
+
+	fresh = !llm_chat.active ||
+	    !buffer_in_list(llm_chat.log_bp) ||
+	    !buffer_in_list(llm_chat.input_bp);
+
+	if (fresh) {
+		if (llm_chat.log_bp != NULL && buffer_in_list(llm_chat.log_bp))
+			(void)killbuffer(llm_chat.log_bp);
+		if (llm_chat.input_bp != NULL &&
+		    buffer_in_list(llm_chat.input_bp))
+			(void)killbuffer(llm_chat.input_bp);
+		chat_free_history();
+
+		llm_chat.log_bp = bfind(LLM_CHAT_BUFNAME, TRUE);
+		llm_chat.input_bp = bfind(LLM_CHAT_INPUT_BUFNAME, TRUE);
+		if (llm_chat.log_bp == NULL || llm_chat.input_bp == NULL) {
+			ewprintf("LLM: cannot create chat buffers");
+			return (FALSE);
+		}
+		(void)bclear(llm_chat.log_bp);
+		(void)bclear(llm_chat.input_bp);
+
+		llm_chat.log_bp->b_flag |= BFREADONLY;
+		llm_chat.input_bp->b_modes[0] = name_mode("fundamental");
+		llm_chat.input_bp->b_modes[1] = chat_mode;
+		llm_chat.input_bp->b_nmodes = 1;
+
+		chat_add_line(llm_chat.log_bp,
+		    "-- *LLM Chat* -- /help for slash commands --", 44);
+		chat_add_separator(llm_chat.log_bp);
+
+		if (llm_chat.system_prompt != NULL &&
+		    llm_chat.system_prompt[0] != '\0') {
+			(void)chat_push_msg("system", llm_chat.system_prompt,
+			    strlen(llm_chat.system_prompt));
+			chat_render_history();
+		}
+
+		llm_chat.active = TRUE;
+		llm_chat.busy = FALSE;
+	}
+
+	if (chat_layout() != TRUE) {
+		ewprintf("LLM: cannot lay out chat windows");
+		return (FALSE);
+	}
+
+	ewprintf("LLM: chat ready; C-c C-c sends, /help for commands");
+	return (TRUE);
+}
+
+/*
+ * C-c C-c in *LLM Input*.  Read the pending prompt, dispatch slash
+ * commands, or send to the model and append the reply to the log.
+ */
+int
+llm_chat_send(int f, int n)
+{
+	char		*prompt = NULL, *reply = NULL;
+	char		*send_text;
+	size_t		 plen;
+	int		 ret = FALSE;
+
+	if (!llm_chat.active || curbp != llm_chat.input_bp) {
+		dobeep();
+		ewprintf("LLM: not in *LLM Input*");
+		return (FALSE);
+	}
+	if (llm_chat.busy) {
+		dobeep();
+		ewprintf("LLM: request in progress");
+		return (FALSE);
+	}
+	if ((prompt = buffer_text(llm_chat.input_bp, &plen)) == NULL) {
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	/* trim trailing whitespace */
+	while (plen > 0 && (prompt[plen - 1] == ' ' ||
+	    prompt[plen - 1] == '\t' || prompt[plen - 1] == '\n' ||
+	    prompt[plen - 1] == '\r')) {
+		plen--;
+	}
+	prompt[plen] = '\0';
+	/* trim leading whitespace (find start) */
+	send_text = prompt;
+	while (*send_text == ' ' || *send_text == '\t' ||
+	    *send_text == '\n' || *send_text == '\r')
+		send_text++;
+
+	if (*send_text == '\0') {
+		dobeep();
+		ewprintf("LLM: empty prompt");
+		free(prompt);
+		return (FALSE);
+	}
+
+	if (send_text[0] == '/' && send_text[1] != '/') {
+		ret = chat_dispatch_slash(send_text);
+		/* Only clear the input pane if the session survived. */
+		if (llm_chat.active && llm_chat.input_bp != NULL &&
+		    buffer_in_list(llm_chat.input_bp)) {
+			(void)bclear(llm_chat.input_bp);
+			chat_focus_input();
+		}
+		free(prompt);
+		return (ret);
+	}
+	if (send_text[0] == '/' && send_text[1] == '/')
+		send_text++;	/* consume one leading slash */
+
+	if (chat_push_msg("user", send_text, strlen(send_text)) != TRUE) {
+		free(prompt);
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	if (chat_append_block(llm_chat.log_bp, "mg>", send_text,
+	    strlen(send_text)) != TRUE) {
+		free(prompt);
+		ewprintf("LLM: cannot append to log");
+		return (FALSE);
+	}
+	chat_scroll_bp_to_end(llm_chat.log_bp);
+
+	llm_chat.busy = TRUE;
+	ewprintf("LLM: querying...");
+	update(CMODE);
+
+	if (chat_send_history(&reply) != TRUE) {
+		llm_chat.busy = FALSE;
+		free(prompt);
+		return (FALSE);
+	}
+	llm_chat.busy = FALSE;
+
+	if (chat_push_msg("assistant", reply, strlen(reply)) != TRUE) {
+		free(reply);
+		free(prompt);
+		ewprintf("LLM: out of memory");
+		return (FALSE);
+	}
+	(void)chat_append_block(llm_chat.log_bp, "llm>", reply,
+	    strlen(reply));
+	chat_scroll_bp_to_end(llm_chat.log_bp);
+	free(reply);
+
+	(void)bclear(llm_chat.input_bp);
+	chat_focus_input();
+	ewprintf("LLM: reply received");
+	free(prompt);
+	return (TRUE);
+}
+
+/*
+ * C-c C-l in *LLM Input*.  Clear the pending prompt.
+ */
+int
+llm_chat_clear_input(int f, int n)
+{
+	if (!llm_chat.active || curbp != llm_chat.input_bp) {
+		dobeep();
+		ewprintf("LLM: not in *LLM Input*");
+		return (FALSE);
+	}
+	(void)bclear(llm_chat.input_bp);
+	chat_focus_input();
+	ewprintf("LLM: input cleared");
+	return (TRUE);
+}
+
+/*
+ * C-c C-q in *LLM Input*.  Same as /quit.
+ */
+int
+llm_chat_quit(int f, int n)
+{
+	if (!llm_chat.active) {
+		dobeep();
+		ewprintf("LLM: no chat session");
+		return (FALSE);
+	}
+	return (slash_quit(""));
+}
+
 /*
  * Keymap for the *LLM Prompt* compose buffer.  Overrides only the
  * C-c prefix; everything else falls through (via rescan defaults)
@@ -1053,10 +2547,59 @@ static struct KEYMAPE (1) llmcomposemap = {
 	}
 };
 
+/*
+ * Keymap for the *LLM Input* buffer.
+ *
+ *	C-c C-c	llm-chat-send
+ *	C-c C-l	llm-chat-clear-input
+ *	C-c C-q	llm-chat-quit
+ */
+static PF llmchat_cc[] = {
+	llm_chat_send,		/* ^C */
+	rescan,			/* ^D */
+	rescan,			/* ^E */
+	rescan,			/* ^F */
+	rescan,			/* ^G */
+	rescan,			/* ^H */
+	rescan,			/* ^I */
+	rescan,			/* ^J */
+	rescan,			/* ^K */
+	llm_chat_clear_input,	/* ^L */
+	rescan,			/* ^M */
+	rescan,			/* ^N */
+	rescan,			/* ^O */
+	rescan,			/* ^P */
+	llm_chat_quit,		/* ^Q */
+};
+
+static struct KEYMAPE (1) llmchat_ccmap = {
+	1, 1, rescan,
+	{
+		{ CCHR('C'), CCHR('Q'), llmchat_cc, NULL }
+	}
+};
+
+static PF llmchat_top[] = {
+	NULL,			/* ^C is a prefix for llmchat_ccmap */
+};
+
+static struct KEYMAPE (1) llmchatmap = {
+	1, 1, rescan,
+	{
+		{ CCHR('C'), CCHR('C'), llmchat_top,
+		    (KEYMAP *)&llmchat_ccmap }
+	}
+};
+
 void
 llm_init(void)
 {
 	funmap_add(llm_compose_send, "llm-compose-send", 0);
 	funmap_add(llm_compose_abort, "llm-compose-abort", 0);
+	funmap_add(llm_chat_cmd, "llm-chat", 0);
+	funmap_add(llm_chat_send, "llm-chat-send", 0);
+	funmap_add(llm_chat_clear_input, "llm-chat-clear-input", 0);
+	funmap_add(llm_chat_quit, "llm-chat-quit", 0);
 	maps_add((KEYMAP *)&llmcomposemap, "llm-compose");
+	maps_add((KEYMAP *)&llmchatmap, "llm-chat");
 }

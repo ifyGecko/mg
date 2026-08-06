@@ -746,6 +746,144 @@ and the
 .Xr curl 1
 binary to be available on
 .Ev PATH .
+.It Ic llm-chat
+Open an interactive multi-turn chat session with the configured
+OpenAI-compatible endpoint.
+The current frame is split into two windows: a read-only
+.Sq *LLM Chat*
+transcript on top and an editable
+.Sq *LLM Input*
+composer (~6 rows) on the bottom.
+Type a prompt in the input pane and press
+.Sq C-c C-c
+to send it; the full conversation history is replayed to the server
+on every turn, so the model always sees the whole session without any
+manual copy-paste.
+Any prompt whose first character is
+.Sq /
+is treated as a slash command (see below); prefix a literal
+.Sq /
+with
+.Sq //
+to send it as text.
+Re-invoking
+.Ic llm-chat
+while a session is live simply re-focuses the input pane.
+.Pp
+Additional keybindings in the
+.Sq *LLM Input*
+buffer:
+.Bl -tag -width Ds -compact
+.It Sq C-c C-c
+Send the pending prompt (or dispatch a slash command).
+.It Sq C-c C-l
+Clear the input pane without sending.
+.It Sq C-c C-q
+Tear down the session (equivalent to
+.Sq /quit ) .
+.El
+.Pp
+Slash commands (typed into
+.Sq *LLM Input*
+and dispatched by
+.Sq C-c C-c ) :
+.Bl -tag -width "/system <text>" -compact
+.It Sq /help
+List the slash commands into the transcript.
+.It Sq /reset
+Free the conversation history and clear the transcript, keeping any
+session-level system prompt.
+.It Sq /compact
+Ask the model to summarize the conversation so far into a single
+compact system note and replace the history with that note.
+Blocking; may take several seconds.
+Use this when the context is growing too large to send on every turn.
+.It Sq /undo
+Drop the last
+.Bd -literal -offset indent -compact
+{user, assistant}
+.Ed
+pair from the history and redraw the transcript to match.
+Useful to retry a prompt after a bad response.
+.It Sq /system <text>
+Set the session-level system prompt.
+Takes effect on the next
+.Sq /reset ;
+does not rewrite an already-active history.
+Invoke with no argument to clear it.
+.It Sq /model
+With no argument, GET the endpoint's
+.Sq /v1/models
+list and print the returned model IDs into the transcript,
+marking the currently active model with an asterisk.
+With an argument, override the session model (does not persist).
+.It Sq /url <url>
+Override the session endpoint URL (does not persist).
+.It Sq /save <path>
+Write the visible transcript to
+.Ar path .
+.It Sq /history
+Report the current message count and total content byte size to the
+echo line.
+.It Sq /clear
+Clear the transcript display only; conversation history is untouched
+so the next turn still carries full context.
+.It Sq /quit
+End the session, free the message history, and kill both LLM
+buffers.
+.El
+.Pp
+Requires
+.Ic llm-set-url
+and
+.Ic llm-set-model
+to have been configured (see
+.Sx CONFIGURATION FILES ) ,
+and the
+.Xr curl 1
+binary to be available on
+.Ev PATH .
+The curl round-trip is synchronous; the editor is unresponsive for
+the duration of each request, and
+.Sq C-g
+does not interrupt an in-flight request.
+There is no chat-history persistence across restarts; use
+.Sq /save
+to keep a transcript.
+Each request replays the full history, so token usage grows with
+conversation length \(en use
+.Sq /compact
+or
+.Sq /reset
+to keep it bounded.
+.It Ic llm-chat-clear-input
+Clear the
+.Sq *LLM Input*
+buffer without sending.
+Bound to
+.Sq C-c C-l
+in
+.Ic llm-chat
+sessions.
+.It Ic llm-chat-quit
+End the current
+.Ic llm-chat
+session, freeing message history and killing the chat/input buffers.
+Bound to
+.Sq C-c C-q
+in
+.Ic llm-chat
+sessions.
+.It Ic llm-chat-send
+Send the pending prompt in the
+.Sq *LLM Input*
+buffer (or dispatch a slash command if the prompt starts with
+.Sq / ) .
+Bound to
+.Sq C-c C-c
+in
+.Ic llm-chat
+sessions.
 .It Ic llm-set-key
 Set the bearer token sent in the
 .Dq Authorization
@@ -761,15 +899,29 @@ Intended for use in the startup file.
 .It Ic llm-set-model
 Set the model name sent in the request body of the
 .Ic llm
-command.
+and
+.Ic llm-chat
+commands.
 Intended for use in the startup file.
+The
+.Ic llm-chat
+.Sq /model <name>
+slash command can override this for a single session.
 .It Ic llm-set-url
 Set the endpoint URL for the
 .Ic llm
-command.
+and
+.Ic llm-chat
+commands.
 Must be a full OpenAI-compatible chat completions URL, e.g.\&
 .Dq http://127.0.0.1:8080/v1/chat/completions .
 Intended for use in the startup file.
+The
+.Ic llm-chat
+.Sq /model
+slash command derives the corresponding
+.Sq /v1/models
+URL from this value.
 .It Ic load
 Prompt the user for a filename, and then execute commands
 from that file.

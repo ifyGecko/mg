@@ -777,6 +777,10 @@ int		 llm_set_model(int, int);
 int		 llm_set_key(int, int);
 int		 llm_compose_send(int, int);
 int		 llm_compose_abort(int, int);
+int		 llm_chat_cmd(int, int);
+int		 llm_chat_send(int, int);
+int		 llm_chat_clear_input(int, int);
+int		 llm_chat_quit(int, int);
 
 /* shell.c */
 void		 shell_init(void);
