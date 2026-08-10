@@ -147,6 +147,7 @@ static struct {
 struct llm_msg {
 	char		*role;		/* "system" | "user" | "assistant" */
 	char		*content;
+	char		*content_esc;	/* lazily filled JSON-escaped content */
 	struct llm_msg	*next;
 };
 
@@ -156,6 +157,7 @@ static struct {
 	struct buffer	*log_bp;
 	struct buffer	*input_bp;
 	struct llm_msg	*history;	/* oldest first */
+	struct llm_msg	*history_tail;	/* fast O(1) append */
 	char		*system_prompt;	/* NULL == no system prompt */
 	char		*model_override;
 	char		*url_override;
@@ -926,6 +928,30 @@ buffer_in_list(struct buffer *bp)
 }
 
 /*
+ * Insert a byte string at dot.  Delegates to linsert() to allocate
+ * space, records a single undo entry, and updates window state --
+ * then overwrites the placeholder bytes with the actual content.
+ * Must not contain '\n'; callers split segments and interleave
+ * lnewline() themselves.
+ */
+static int
+linsert_bytes(const char *s, size_t len)
+{
+	struct line	*lp;
+	int		 doto;
+
+	if (len == 0)
+		return (TRUE);
+	if (linsert((int)len, ' ') == FALSE)
+		return (FALSE);
+	lp = curwp->w_dotp;
+	doto = curwp->w_doto;
+	/* the len bytes just inserted sit at [doto - len .. doto - 1] */
+	memcpy(&lp->l_text[doto - (int)len], s, len);
+	return (TRUE);
+}
+
+/*
  * Run the LLM query and replace the saved region.  Assumes curbp/curwp
  * are pointed at the source buffer and the saved dot/mark are valid.
  * Used by both the interactive (compose-send) and inmacro paths.
@@ -1040,19 +1066,28 @@ llm_run(const char *user_instr)
 			goto done;
 		}
 	}
-	for (i = 0; i < codelen; i++) {
-		if (code[i] == '\n') {
-			if (lnewline() == FALSE) {
-				undo_boundary_enable(FFRAND, 1);
-				ewprintf("LLM: insert failed");
-				goto done;
+	{
+		size_t	start = 0, j;
+
+		for (j = 0; j <= codelen; j++) {
+			if (j < codelen && code[j] != '\n')
+				continue;
+			if (j > start) {
+				if (linsert_bytes(code + start,
+				    j - start) == FALSE) {
+					undo_boundary_enable(FFRAND, 1);
+					ewprintf("LLM: insert failed");
+					goto done;
+				}
 			}
-		} else {
-			if (linsert(1, (unsigned char)code[i]) == FALSE) {
-				undo_boundary_enable(FFRAND, 1);
-				ewprintf("LLM: insert failed");
-				goto done;
+			if (j < codelen) {
+				if (lnewline() == FALSE) {
+					undo_boundary_enable(FFRAND, 1);
+					ewprintf("LLM: insert failed");
+					goto done;
+				}
 			}
+			start = j + 1;
 		}
 	}
 	undo_boundary_enable(FFRAND, 1);
@@ -1306,10 +1341,12 @@ chat_free_history(void)
 		nx = m->next;
 		free(m->role);
 		free(m->content);
+		free(m->content_esc);
 		free(m);
 		m = nx;
 	}
 	llm_chat.history = NULL;
+	llm_chat.history_tail = NULL;
 }
 
 /*
@@ -1319,7 +1356,7 @@ chat_free_history(void)
 static int
 chat_push_msg(const char *role, const char *content, size_t content_len)
 {
-	struct llm_msg	*m, *tail;
+	struct llm_msg	*m;
 
 	if ((m = calloc(1, sizeof(*m))) == NULL)
 		return (FALSE);
@@ -1335,14 +1372,14 @@ chat_push_msg(const char *role, const char *content, size_t content_len)
 	if (content_len > 0)
 		memcpy(m->content, content, content_len);
 	m->content[content_len] = '\0';
+	/* content_esc left NULL; filled lazily by chat_build_body */
 
-	if (llm_chat.history == NULL) {
+	if (llm_chat.history_tail == NULL) {
 		llm_chat.history = m;
+		llm_chat.history_tail = m;
 	} else {
-		for (tail = llm_chat.history; tail->next != NULL;
-		    tail = tail->next)
-			;
-		tail->next = m;
+		llm_chat.history_tail->next = m;
+		llm_chat.history_tail = m;
 	}
 	return (TRUE);
 }
@@ -1372,13 +1409,18 @@ chat_pop_last_pair(void)
 	for (cur = llm_chat.history; cur != penult; cur = cur->next)
 		prev = cur;
 
-	if (prev == NULL)
+	if (prev == NULL) {
 		llm_chat.history = NULL;
-	else
+		llm_chat.history_tail = NULL;
+	} else {
 		prev->next = NULL;
+		llm_chat.history_tail = prev;
+	}
 
-	free(penult->role); free(penult->content); free(penult);
-	free(last->role); free(last->content); free(last);
+	free(penult->role); free(penult->content); free(penult->content_esc);
+	free(penult);
+	free(last->role); free(last->content); free(last->content_esc);
+	free(last);
 	return (TRUE);
 }
 
@@ -1685,23 +1727,26 @@ chat_build_body(char **body, size_t *bodylen,
 	}
 
 	for (m = llm_chat.history; m != NULL; m = m->next) {
-		char *role_esc = json_escape(m->role);
-		char *content_esc = json_escape(m->content);
-		if (role_esc == NULL || content_esc == NULL) {
-			free(role_esc); free(content_esc);
-			free(buf); free(model_esc);
-			ewprintf("LLM: out of memory");
-			return (FALSE);
+		if (m->content_esc == NULL) {
+			m->content_esc = json_escape(m->content);
+			if (m->content_esc == NULL) {
+				free(buf); free(model_esc);
+				ewprintf("LLM: out of memory");
+				return (FALSE);
+			}
 		}
 		if (!first)
 			APPEND_S(",");
+		/*
+		 * Role strings are always one of "system", "user",
+		 * "assistant" -- no characters requiring JSON escaping,
+		 * so emit them directly.
+		 */
 		APPEND_S("{\"role\":\"");
-		APPEND_S(role_esc);
+		APPEND_S(m->role);
 		APPEND_S("\",\"content\":\"");
-		APPEND_S(content_esc);
+		APPEND_S(m->content_esc);
 		APPEND_S("\"}");
-		free(role_esc);
-		free(content_esc);
 		first = FALSE;
 	}
 
