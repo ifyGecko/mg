@@ -159,6 +159,7 @@ main(int argc, char **argv)
 		extern void makemode_init(void);
 		extern void hexmode_init(void);
 		extern void snake_init(void);
+		extern void blocks_init(void);
 
 		dired_init();
 		grep_init();
@@ -166,6 +167,7 @@ main(int argc, char **argv)
 		makemode_init();
 		hexmode_init();
 		snake_init();
+		blocks_init();
 		shell_init();
 		term_init();
 

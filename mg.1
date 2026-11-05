@@ -418,6 +418,17 @@ is used as its own match.
 Can be used in the startup file with the
 .Ic global-set-key
 command.
+.It Ic blocks
+Play a falling-block puzzle game in the
+.Em *Blocks*
+buffer.
+Move pieces with left/right, C-b/C-f, h/l or a/d; rotate with up,
+C-p, k, w or x (z rotates the other way); soft drop with down, C-n,
+j or s; SPC drops the piece all the way.
+Completed rows are cleared and scored; every ten rows raise the level
+and the speed.
+p pauses, r starts a new game once the game is over, and q or C-g
+quits back to the editor.
 .It Ic bsmap-mode
 Toggle bsmap mode, where DEL and C-h are swapped.
 .It Ic c-mode
