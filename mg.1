@@ -1041,6 +1041,15 @@ The argument
 .Va n
 controls how many columns to shrink.
 A negative argument enlarges instead.
+.It Ic snake
+Play a game of snake in the
+.Em *Snake*
+buffer.
+Steer with the arrow keys, C-f/C-b/C-n/C-p, h/j/k/l or w/a/s/d.
+Eating food grows the snake and speeds it up; running into a wall or
+the snake's own body ends the game.
+p or SPC pauses, r starts a new game once the game is over, and q or
+C-g quits back to the editor.
 .It Ic space-to-tabstop
 Insert enough spaces to reach the next tab-stop position.
 By default, tab-stops occur every 8 characters.

@@ -158,12 +158,14 @@ main(int argc, char **argv)
 		extern void dired_init(void);
 		extern void makemode_init(void);
 		extern void hexmode_init(void);
+		extern void snake_init(void);
 
 		dired_init();
 		grep_init();
 		cmode_init();
 		makemode_init();
 		hexmode_init();
+		snake_init();
 		shell_init();
 		term_init();
 

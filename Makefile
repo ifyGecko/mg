@@ -22,7 +22,7 @@ SRCS=	autoexec.c basic.c bell.c buffer.c cinfo.c dir.c display.c \
 #
 # More or less standalone extensions.
 #
-SRCS+=	cmode.c dired.c grep.c hexmode.c interpreter.c makemode.c
+SRCS+=	cmode.c dired.c grep.c hexmode.c interpreter.c makemode.c snake.c
 
 #
 # -DMGLOG source file.
