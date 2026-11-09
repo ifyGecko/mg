@@ -948,7 +948,10 @@ Prompt the user for a fill column.
 Used by
 .Ic auto-fill-mode .
 .It Ic set-mark-command
-Sets the mark in the current window to the current dot location.
+If a region is active, deactivates it and clears the mark, regardless of
+where dot is.
+Otherwise, sets the mark in the current window to the current dot location
+and activates the region.
 .It Ic set-prefix-string
 Sets the prefix string to be used by the
 .Ic prefix-region

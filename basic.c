@@ -568,19 +568,15 @@ isetmark(void)
 }
 
 /*
- * Set the mark in the current window
- * to the value of dot. A message is written to
- * the echo line.  (ewprintf knows about macros)
- *
- * If the mark is already set at the current dot, deactivate it instead.
- * This gives the user a way to dismiss an active region without moving.
+ * Toggle the region: if a region is active, deactivate it regardless of
+ * where dot is; otherwise set the mark in the current window to the value
+ * of dot and activate it.  A message is written to the echo line.
+ * (ewprintf knows about macros)
  */
 int
 setmark(int f, int n)
 {
-	if (curwp->w_markp != NULL &&
-	    curwp->w_markp == curwp->w_dotp &&
-	    curwp->w_marko == curwp->w_doto) {
+	if (curwp->w_markp != NULL && curwp->w_markactive) {
 		(void)clearmark(f, n);
 		ewprintf("Mark deactivated");
 		return (TRUE);
